@@ -197,8 +197,9 @@ export function ConfigPanel() {
         </div>
       </div>
 
-      <ScrollArea className="flex-1">
-        <div className="space-y-4 p-4">
+      <div className="flex-1 min-h-0">
+        <ScrollArea className="h-full">
+          <div className="space-y-4 p-4">
 
           {/* ===== SCHEDULE/START ===== */}
           {nodeType === 'start' && (<>
@@ -209,7 +210,7 @@ export function ConfigPanel() {
               </Select></div>
             {nodeData.scheduleType !== 'interval' && (<div className="space-y-2"><Label className="text-xs">Time</Label><Input type="time" className="h-8" value={(nodeData.time as string) || '09:15'} onChange={(e) => handleDataChange('time', e.target.value)} /></div>)}
             {nodeData.scheduleType === 'interval' && (<div className="space-y-2"><Label className="text-xs">Repeat Every</Label><div className="flex gap-2"><Input type="number" min="1" className="h-8 w-20" value={(nodeData.intervalValue as number) || 1} onChange={(e) => handleDataChange('intervalValue', parseInt(e.target.value, 10) || 1)} /><Select value={(nodeData.intervalUnit as string) || 'minutes'} onValueChange={(v) => handleDataChange('intervalUnit', v)}><SelectTrigger className="h-8 flex-1"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="seconds">Seconds</SelectItem><SelectItem value="minutes">Minutes</SelectItem><SelectItem value="hours">Hours</SelectItem></SelectContent></Select></div></div>)}
-            {(nodeData.scheduleType === 'daily' || nodeData.scheduleType === 'weekly') && (<div className="space-y-2"><Label className="text-xs">Run On Days</Label><div className="flex flex-wrap gap-1 mb-2"><button type="button" onClick={() => handleDataChange('days', [0,1,2,3,4])} className="rounded-md bg-muted px-2 py-1 text-[10px] hover:bg-accent">Weekdays</button><button type="button" onClick={() => handleDataChange('days', [5,6])} className="rounded-md bg-muted px-2 py-1 text-[10px] hover:bg-accent">Weekends</button><button type="button" onClick={() => handleDataChange('days', [0,1,2,3,4,5,6])} className="rounded-md bg-muted px-2 py-1 text-[10px] hover:bg-accent">All</button></div><div className="flex flex-wrap gap-1">{DAYS_OF_WEEK.map((day) => { const days = (nodeData.days as number[]) || [0,1,2,3,4]; const sel = days.includes(day.value); return (<button key={day.value} type="button" onClick={() => handleDataChange('days', sel ? days.filter(d => d !== day.value) : [...days, day.value].sort())} className={cn('flex h-8 w-8 items-center justify-center rounded-md text-xs font-medium', sel ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:bg-accent')}>{day.label}</button>)})}</div></div>)}
+            {(nodeData.scheduleType === 'daily' || nodeData.scheduleType === 'weekly') && (<div className="space-y-2"><Label className="text-xs">Run On Days</Label><div className="flex flex-wrap gap-1 mb-2"><button type="button" onClick={() => handleDataChange('days', [0, 1, 2, 3, 4])} className="rounded-md bg-muted px-2 py-1 text-[10px] hover:bg-accent">Weekdays</button><button type="button" onClick={() => handleDataChange('days', [5, 6])} className="rounded-md bg-muted px-2 py-1 text-[10px] hover:bg-accent">Weekends</button><button type="button" onClick={() => handleDataChange('days', [0, 1, 2, 3, 4, 5, 6])} className="rounded-md bg-muted px-2 py-1 text-[10px] hover:bg-accent">All</button></div><div className="flex flex-wrap gap-1">{DAYS_OF_WEEK.map((day) => { const days = (nodeData.days as number[]) || [0, 1, 2, 3, 4]; const sel = days.includes(day.value); return (<button key={day.value} type="button" onClick={() => handleDataChange('days', sel ? days.filter(d => d !== day.value) : [...days, day.value].sort())} className={cn('flex h-8 w-8 items-center justify-center rounded-md text-xs font-medium', sel ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:bg-accent')}>{day.label}</button>) })}</div></div>)}
             {nodeData.scheduleType === 'once' && (<div className="space-y-2"><Label className="text-xs">Date</Label><Input type="date" className="h-8" value={(nodeData.executeAt as string) || ''} onChange={(e) => handleDataChange('executeAt', e.target.value)} /></div>)}
           </>)}
 
@@ -372,6 +373,7 @@ export function ConfigPanel() {
           {nodeType === 'expiry' && (<>
             <div className="space-y-2"><Label className="text-xs">Symbol</Label><Input className="h-8" placeholder="NIFTY" value={(nodeData.symbol as string) || ''} onChange={(e) => handleDataChange('symbol', e.target.value)} /></div>
             <div className="space-y-2"><Label className="text-xs">Exchange</Label><Select value={(nodeData.exchange as string) || 'NFO'} onValueChange={(v) => handleDataChange('exchange', v)}><SelectTrigger className="h-8"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="NFO">NFO</SelectItem><SelectItem value="BFO">BFO</SelectItem><SelectItem value="MCX">MCX</SelectItem><SelectItem value="CDS">CDS</SelectItem></SelectContent></Select></div>
+            <div className="space-y-2"><Label className="text-xs">Instrument Type</Label><Select value={(nodeData.instrumenttype as string) || 'options'} onValueChange={(v) => handleDataChange('instrumenttype', v)}><SelectTrigger className="h-8"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="options">Options</SelectItem><SelectItem value="futures">Futures</SelectItem></SelectContent></Select><p className="text-[10px] text-muted-foreground">Futures and options have different expiry calendars</p></div>
             <div className="space-y-2"><Label className="text-xs">Output Variable</Label><Input className="h-8" placeholder="expiries" value={(nodeData.outputVariable as string) || ''} onChange={(e) => handleDataChange('outputVariable', e.target.value)} /><p className="text-[10px] text-muted-foreground">Use {`{{expiries.data[0]}}`}</p></div>
           </>)}
 
@@ -559,8 +561,9 @@ export function ConfigPanel() {
 
           <Separator />
           <div className="space-y-2"><Label className="text-xs text-muted-foreground">Node ID</Label><code className="block text-[10px] bg-muted px-2 py-1 rounded font-mono">{selectedNode.id}</code></div>
-        </div>
-      </ScrollArea>
+          </div>
+        </ScrollArea>
+      </div>
     </div>
   )
 }

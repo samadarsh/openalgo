@@ -44,7 +44,7 @@ OPENALGO_DIR="$SCRIPT_DIR"
 XTS_BROKERS="fivepaisaxts,compositedge,ibulls,iifl,jainamxts,rmoney,wisdom"
 
 # Valid brokers list
-VALID_BROKERS="fivepaisa,fivepaisaxts,aliceblue,angel,compositedge,definedge,deltaexchange,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,ibulls,iifl,indmoney,jainamxts,kotak,motilal,mstock,nubra,paytm,pocketful,rmoney,samco,shoonya,tradejini,upstox,wisdom,zebu,zerodha"
+VALID_BROKERS="fivepaisa,fivepaisaxts,aliceblue,angel,compositedge,definedge,deltaexchange,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,ibulls,iifl,iiflcapital,indmoney,jainamxts,kotak,motilal,mstock,nubra,paytm,pocketful,rmoney,samco,shoonya,tradejini,upstox,wisdom,zebu,zerodha"
 
 # Banner
 echo ""
@@ -175,13 +175,20 @@ do_setup() {
     log_info "Updating configuration with secure keys..."
     if [[ "$OSTYPE" == "darwin"* ]]; then
         # macOS sed syntax
-        sed -i '' "s/3daa0403ce2501ee7432b75bf100048e3cf510d63d2754f952e93d88bf07ea84/$APP_KEY/g" "$OPENALGO_DIR/$ENV_FILE"
-        sed -i '' "s/a25d94718479b170c16278e321ea6c989358bf499a658fd20c90033cef8ce772/$API_KEY_PEPPER/g" "$OPENALGO_DIR/$ENV_FILE"
+        sed -i '' "s/OPENALGO_PLACEHOLDER_APP_KEY_REGENERATE_BEFORE_USE/$APP_KEY/g" "$OPENALGO_DIR/$ENV_FILE"
+        sed -i '' "s/OPENALGO_PLACEHOLDER_API_KEY_PEPPER_REGENERATE_BEFORE_USE/$API_KEY_PEPPER/g" "$OPENALGO_DIR/$ENV_FILE"
     else
         # Linux sed syntax
-        sed -i "s/3daa0403ce2501ee7432b75bf100048e3cf510d63d2754f952e93d88bf07ea84/$APP_KEY/g" "$OPENALGO_DIR/$ENV_FILE"
-        sed -i "s/a25d94718479b170c16278e321ea6c989358bf499a658fd20c90033cef8ce772/$API_KEY_PEPPER/g" "$OPENALGO_DIR/$ENV_FILE"
+        sed -i "s/OPENALGO_PLACEHOLDER_APP_KEY_REGENERATE_BEFORE_USE/$APP_KEY/g" "$OPENALGO_DIR/$ENV_FILE"
+        sed -i "s/OPENALGO_PLACEHOLDER_API_KEY_PEPPER_REGENERATE_BEFORE_USE/$API_KEY_PEPPER/g" "$OPENALGO_DIR/$ENV_FILE"
     fi
+    # Note: deliberately NOT chmod 600 here. The container runs as appuser
+    # (UID 1000) and bind-mounts $ENV_FILE read-only into /app/.env; mode
+    # 600 owned by the host user (who is typically not UID 1000 on a desktop
+    # Mac/Linux box) would make the file unreadable inside the container,
+    # crash-looping the container with "Error: .env file not found."
+    # See https://github.com/marketcalls/openalgo/issues/960.
+    # The default cp mode (644) is what we want for Docker bind-mounts.
     log_ok "Secure keys generated and saved."
 
     # Get broker configuration
@@ -193,7 +200,7 @@ do_setup() {
     echo "  Valid brokers:"
     echo "  fivepaisa, fivepaisaxts, aliceblue, angel, compositedge,"
     echo "  definedge, deltaexchange, dhan, dhan_sandbox, firstock, flattrade, fyers,"
-    echo "  groww, ibulls, iifl, indmoney, jainamxts, kotak, motilal,"
+    echo "  groww, ibulls, iifl, iiflcapital, indmoney, jainamxts, kotak, motilal,"
     echo "  mstock, nubra, paytm, pocketful, rmoney, samco, shoonya,"
     echo "  tradejini, upstox, wisdom, zebu, zerodha"
     echo ""
