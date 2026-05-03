@@ -113,7 +113,7 @@ OpenAlgo uses **6 separate databases** for isolation:
 - `db/logs.db` - Traffic and API logs
 - `db/latency.db` - Latency monitoring data
 - `db/health.db` - Health monitoring data
-- `db/sandbox.db` - Analyzer/sandbox mode (isolated virtual trading)
+- `db/sandbox.db` - Analyzer/sandbox mode (isolated sandbox trading)
 - `db/historify.duckdb` - Historical market data (DuckDB)
 
 Each database has its own initialization function in `/database/`.
@@ -290,9 +290,9 @@ Orders can flow through two modes:
 
 Approval workflow in `database/action_center_db.py` and `services/action_center_service.py`
 
-### Analyzer Mode (Paper Trading)
+### Analyzer Mode (Sandbox Trading)
 
-Separate database (`sandbox.db`) with ₹1 Crore virtual capital:
+Separate database (`sandbox.db`) with ₹1 Crore sandbox capital:
 - Realistic margin system with leverage
 - Auto square-off at exchange timings
 - Complete isolation from live trading
@@ -418,7 +418,7 @@ OpenAlgo uses a standardized symbol format across all 30+ brokers. Broker-specif
 
 **Options:** `[BaseSymbol][ExpiryDate][Strike][CE/PE]` — `NIFTY28MAR2420800CE`, `VEDL25APR24292.5CE`
 
-**Exchange codes:** `NSE` (equity), `BSE` (equity), `NFO` (NSE F&O), `BFO` (BSE F&O), `CDS` (NSE currency), `BCD` (BSE currency), `MCX` (commodity), `NCDEX` (commodity), `NSE_INDEX` (indices), `BSE_INDEX` (indices)
+**Exchange codes:** `NSE` (equity), `BSE` (equity), `NFO` (NSE F&O), `BFO` (BSE F&O), `CDS` (NSE currency), `BCD` (BSE currency), `MCX` (commodity), `NCDEX` (commodity), `NCO` (NSE commodities — Zerodha only), `NSE_INDEX` (indices), `BSE_INDEX` (indices), `GLOBAL_INDEX` (global indices — Zerodha only, quote-only; includes US30/JAPAN225/HANGSENG and `GIFTNIFTY` from NSE IFSC)
 
 **Order constants:**
 - **Product:** `CNC` (cash & carry / delivery), `NRML` (futures & options carry), `MIS` (intraday square-off)
