@@ -2,6 +2,7 @@ import json
 import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for
 
@@ -612,7 +613,12 @@ _MAX_TAIL_BYTES = 10 * 1024 * 1024  # 10 MB cap on tail-read
 _REPORT_RATE = "10/minute"
 _DIAG_RATE = "10/minute"
 
-# Sensitive env var names — never emit values, only "set"/"not set"
+# Sensitive env var names — never emit values, only "set"/"not set".
+# These are the env vars actually consumed by the codebase. SMTP credentials,
+# Telegram bot tokens, and any future Google OAuth secrets are stored encrypted
+# in the database (see `_db_secrets_status` below) — not in env — so they
+# don't belong in this list. Reporting them here would always say "not set"
+# even when the feature is fully configured (issue #1388).
 _SECRET_ENV_KEYS = frozenset(
     {
         "APP_KEY",
@@ -622,11 +628,91 @@ _SECRET_ENV_KEYS = frozenset(
         "BROKER_API_KEY_MARKET",
         "BROKER_API_SECRET_MARKET",
         "REDIRECT_URL",
-        "SMTP_PASSWORD",
-        "TELEGRAM_BOT_TOKEN",
-        "GOOGLE_CLIENT_SECRET",
     }
 )
+
+
+def _db_secrets_status() -> dict:
+    """Presence-only status for secrets stored in the database (not env).
+
+    Returns a {label: bool} dict where the label is rendered as-is in the
+    diagnostics UI. Each lookup is wrapped in try/except so a transient DB
+    failure on one feature can't blank out the whole diagnostics page.
+    """
+    out: dict[str, bool] = {}
+
+    try:
+        from database.settings_db import get_smtp_settings
+
+        smtp = get_smtp_settings() or {}
+        out["SMTP password (DB)"] = bool(smtp.get("smtp_password"))
+    except Exception:
+        out["SMTP password (DB)"] = False
+
+    try:
+        from database.telegram_db import get_bot_config
+
+        bot = get_bot_config() or {}
+        out["Telegram bot token (DB)"] = bool(bot.get("bot_token") or bot.get("token"))
+    except Exception:
+        out["Telegram bot token (DB)"] = False
+
+    return out
+
+
+def _secret_strength_status() -> dict:
+    """Per-secret randomization status.
+
+    Reports True when a secret is plausibly install-specific (random hex of
+    sufficient length, not a known placeholder, not a leaked literal). False
+    means the secret is the publicly-known sample value, the placeholder
+    string from .sample.env, blank, or otherwise weak — i.e. functionally
+    no protection. This surfaces the kind of regression where an operator
+    skipped install.sh and just `cp .sample.env .env`.
+
+    Reading-side notes:
+        - We never include the actual values, only the boolean verdict.
+        - The set of "compromised" sentinels is imported from utils.env_check
+          so it stays in sync with the auto-rotation logic that runs on first
+          boot. Adding a new placeholder there auto-flows through to here.
+    """
+    try:
+        from utils.env_check import (
+            COMPROMISED_APP_KEYS,
+            COMPROMISED_PEPPERS,
+            PLACEHOLDER_FERNET_SALT,
+        )
+    except Exception:
+        # Module shape changed — skip the section rather than crash diagnostics.
+        return {}
+
+    import re as _re
+
+    def _is_random_hex(value: str, min_chars: int = 32) -> bool:
+        if not value:
+            return False
+        if len(value) < min_chars:
+            return False
+        return bool(_re.fullmatch(r"[0-9a-fA-F]+", value))
+
+    out: dict[str, bool] = {}
+
+    app_key = os.getenv("APP_KEY", "")
+    out["APP_KEY randomized"] = bool(
+        app_key and app_key not in COMPROMISED_APP_KEYS and len(app_key) >= 32
+    )
+
+    pepper = os.getenv("API_KEY_PEPPER", "")
+    out["API_KEY_PEPPER randomized"] = bool(
+        pepper and pepper not in COMPROMISED_PEPPERS and len(pepper) >= 32
+    )
+
+    salt = (os.getenv("FERNET_SALT") or "").strip()
+    out["FERNET_SALT per-install"] = bool(
+        salt and salt != PLACEHOLDER_FERNET_SALT and _is_random_hex(salt)
+    )
+
+    return out
 
 
 def _errors_file_path():
@@ -770,6 +856,27 @@ _MAX_CLIENT_URL_LEN = 2000
 _MAX_CLIENT_COMPONENT_STACK_LEN = 5000
 _MAX_CLIENT_USER_AGENT_LEN = 500
 _CLIENT_LEVEL_ALLOWLIST = frozenset({"ERROR", "WARN"})
+_REDACTED_CLIENT_URL_VALUE = "[redacted]"
+_SENSITIVE_CLIENT_URL_QUERY_PARAMETER_NAMES = frozenset(
+    {
+        "token",
+        "code",
+        "requesttoken",
+        "accesstoken",
+        "authtoken",
+        "refreshtoken",
+        "resettoken",
+        "apikey",
+        "email",
+        "state",
+        "password",
+        "otp",
+        "secret",
+        "clientsecret",
+        "idtoken",
+        "jwt",
+    }
+)
 
 # Logger dedicated to browser-reported errors. Distinct name so they're easy
 # to filter in errors.jsonl and in the grouped view.
@@ -792,6 +899,32 @@ def _scrub_control_chars(text):
     return "".join(ch for ch in text if ch == "\n" or ch == "\t" or (ch.isprintable()))
 
 
+def _sanitize_client_error_url(url):
+    """Redact sensitive query values and remove fragments before logging a URL."""
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return url.split("?", 1)[0].split("#", 1)[0]
+
+    if parsed.scheme in {"", "http", "https"}:
+        query = urlencode(
+            [
+                (
+                    key,
+                    _REDACTED_CLIENT_URL_VALUE
+                    if key.lower().replace("_", "").replace("-", "")
+                    in _SENSITIVE_CLIENT_URL_QUERY_PARAMETER_NAMES
+                    else value,
+                )
+                for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            ]
+        )
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ""))
+    if parsed.scheme.endswith("-extension"):
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    return f"{parsed.scheme}:"
+
+
 @admin_bp.route("/api/errors/client", methods=["POST"])
 @check_session_validity
 @limiter.limit(_CLIENT_REPORT_RATE)
@@ -812,7 +945,9 @@ def api_errors_client_report():
 
         message = _scrub_control_chars(str(data.get("message") or ""))[:_MAX_CLIENT_MESSAGE_LEN]
         stack = _scrub_control_chars(str(data.get("stack") or ""))[:_MAX_CLIENT_STACK_LEN]
-        url = _scrub_control_chars(str(data.get("url") or ""))[:_MAX_CLIENT_URL_LEN]
+        url = _sanitize_client_error_url(
+            _scrub_control_chars(str(data.get("url") or ""))
+        )[:_MAX_CLIENT_URL_LEN]
         component_stack = _scrub_control_chars(str(data.get("component_stack") or ""))[
             :_MAX_CLIENT_COMPONENT_STACK_LEN
         ]
@@ -1188,6 +1323,18 @@ def _build_info():
     except OSError:
         pass
 
+    # Docker images don't ship .git/ (it's in .dockerignore), so the .git/HEAD
+    # read above always misses inside containers (issue #1388). Fall back to
+    # build-time env vars that install scripts populate from `git rev-parse`.
+    if not info["git_branch"]:
+        env_branch = os.getenv("OPENALGO_GIT_BRANCH")
+        if env_branch:
+            info["git_branch"] = env_branch.strip()[:64]
+    if not info["git_commit"]:
+        env_commit = os.getenv("OPENALGO_GIT_COMMIT")
+        if env_commit:
+            info["git_commit"] = env_commit.strip()[:12]
+
     try:
         idx = Path("frontend/dist/index.html")
         if idx.exists():
@@ -1202,6 +1349,13 @@ def _build_info():
 def _safe_config_snapshot():
     """Public-safe view of config — secrets reduced to set/not-set booleans."""
     secret_status = {key: bool(os.getenv(key)) for key in _SECRET_ENV_KEYS}
+    # Augment with DB-stored secret presence (SMTP, Telegram). Without this,
+    # users with fully-configured features see "not set" because those creds
+    # never lived in env to begin with — see issue #1388.
+    secret_status.update(_db_secrets_status())
+    # Per-secret randomization status (APP_KEY / API_KEY_PEPPER / FERNET_SALT
+    # not the publicly-known sample placeholder values). Surfaces operators
+    # who skipped install.sh and copied .sample.env directly. See #1394.
     return {
         "valid_brokers": [
             b.strip() for b in (os.getenv("VALID_BROKERS") or "").split(",") if b.strip()
@@ -1216,6 +1370,7 @@ def _safe_config_snapshot():
         "api_rate_limit": os.getenv("API_RATE_LIMIT", "50 per second"),
         "flask_debug": (os.getenv("FLASK_DEBUG") or "False").lower() == "true",
         "secrets_present": secret_status,
+        "secret_strength": _secret_strength_status(),
     }
 
 
@@ -1377,26 +1532,53 @@ def _check_db_read():
 
 
 def _check_loopback_http():
-    """HEAD / on the local Flask app — measures internal request latency."""
+    """HEAD the local Flask app — measures internal request latency.
+
+    Candidate targets, because the listening topology differs by install, in
+    the same resolution order as blueprints/mcp_http.py:
+      - MCP_LOOPBACK_URL: explicit override for unusual topologies. Tried
+        first, since an operator who had to set it did so precisely because
+        neither default answers (GitHub issue #1441).
+      - Docker / dev server: gunicorn (or Flask) listens on TCP
+        127.0.0.1:{FLASK_PORT|PORT}.
+      - Ubuntu install.sh: gunicorn binds to a UNIX SOCKET behind nginx — no
+        TCP port answers locally, so HOST_SERVER via nginx is the only
+        loopback that works.
+    Trying only the TCP port made this check a guaranteed false alarm on
+    every native Ubuntu install (GitHub issue #1483).
+    """
     import time
     import urllib.request
 
-    started = time.perf_counter()
-    try:
-        # FLASK_PORT is the canonical OpenAlgo var; PORT is the Docker/Railway
-        # convention (gunicorn binds to ${PORT:-5000} in start.sh).
-        port = os.getenv("FLASK_PORT") or os.getenv("PORT") or "5000"
-        req = urllib.request.Request(f"http://127.0.0.1:{port}/", method="HEAD")
-        with urllib.request.urlopen(req, timeout=3.0) as resp:
-            elapsed = round((time.perf_counter() - started) * 1000, 1)
-            return {
-                "name": "Loopback HTTP",
-                "ok": resp.status < 500,
-                "ms": elapsed,
-                "detail": f"HTTP {resp.status}",
-            }
-    except Exception as e:
-        return {"name": "Loopback HTTP", "ok": False, "ms": None, "detail": str(e)[:200]}
+    # FLASK_PORT is the canonical OpenAlgo var; PORT is the Docker/Railway
+    # convention (gunicorn binds to ${PORT:-5000} in start.sh).
+    port = os.getenv("FLASK_PORT") or os.getenv("PORT") or "5000"
+
+    targets = []
+    override = (os.getenv("MCP_LOOPBACK_URL") or "").strip().rstrip("/")
+    if override:
+        targets.append((f"{override}/", "MCP_LOOPBACK_URL"))
+    targets.append((f"http://127.0.0.1:{port}/", "direct"))
+    host_server = (os.getenv("HOST_SERVER") or "").strip().rstrip("/")
+    if host_server and "127.0.0.1" not in host_server and "localhost" not in host_server:
+        targets.append((f"{host_server}/", "via nginx (unix-socket bind)"))
+
+    last_error = "no target answered"
+    for target, label in targets:
+        started = time.perf_counter()
+        try:
+            req = urllib.request.Request(target, method="HEAD")
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                elapsed = round((time.perf_counter() - started) * 1000, 1)
+                return {
+                    "name": "Loopback HTTP",
+                    "ok": resp.status < 500,
+                    "ms": elapsed,
+                    "detail": f"HTTP {resp.status} ({label})",
+                }
+        except Exception as e:
+            last_error = str(e)
+    return {"name": "Loopback HTTP", "ok": False, "ms": None, "detail": last_error[:200]}
 
 
 def _check_websocket_proxy():
@@ -1541,8 +1723,6 @@ def _render_report(payload, errors_summary, errors_recent, fmt):
     bullet = "- " if is_md else "  - "
     h1 = "# " if is_md else ""
     h2 = "## " if is_md else ""
-    code_open = "```\n" if is_md else ""
-    code_close = "```\n" if is_md else ""
 
     lines = []
     lines.append(f"{h1}OpenAlgo System Report")
@@ -1622,6 +1802,12 @@ def _render_report(payload, errors_summary, errors_recent, fmt):
         lines.append(f"{h2}Secrets (presence only)")
         for k, v in sorted(secrets.items()):
             lines.append(f"{bullet}{k}: {'set' if v else 'not set'}")
+    strength = cfg.get("secret_strength") or {}
+    if strength:
+        lines.append("")
+        lines.append(f"{h2}Secret strength")
+        for k, v in sorted(strength.items()):
+            lines.append(f"{bullet}{k}: {'yes' if v else 'NO — using default/placeholder'}")
     lines.append("")
 
     brokers = payload.get("brokers") or {}
@@ -1845,7 +2031,8 @@ def api_oauth_client_approve(client_id):
         return jsonify({"status": "error", "message": "Remote MCP is not enabled."}), 400
 
     try:
-        from database.oauth_db import OAuthClient, db_session as oauth_session
+        from database.oauth_db import OAuthClient
+        from database.oauth_db import db_session as oauth_session
 
         client = OAuthClient.query.filter_by(client_id=client_id).first()
         if client is None:
@@ -2062,3 +2249,207 @@ def api_mcp_kill_switch():
     except Exception as e:
         logger.exception(f"Error executing MCP kill switch: {e}")
         return jsonify({"status": "error", "message": "Failed to execute kill switch."}), 500
+
+
+# ----------------------------------------------------------------------------
+# Remote MCP settings (master switch + posture toggles)
+# ----------------------------------------------------------------------------
+# These endpoints let the operator flip MCP on/off and adjust the OAuth
+# posture from /admin/remote-mcp without SSH'ing into the server.
+#
+# IMPORTANT: changes are written to the .env file but require a service
+# restart (sudo systemctl restart openalgo) before they take effect —
+# MCP_HTTP_ENABLED is checked at app boot to register Flask blueprints,
+# and the per-request flags are read via os.getenv() at module level.
+# The PUT endpoint surfaces this clearly via restart_required=true.
+
+import re
+
+from utils.env_check import _atomic_replace_text
+
+_ENV_KEY_PATTERN = re.compile(r"^([A-Z][A-Z0-9_]*)$")
+
+
+def _resolve_env_path() -> Path:
+    """Return the absolute Path to .env in the running app's working dir.
+
+    systemd's WorkingDirectory points at OPENALGO_PATH for the production
+    install, so cwd is the right anchor. Local dev runs uv from repo root,
+    same answer. We resolve once and validate the file exists rather
+    than trying multiple candidates — a missing .env is a deployment bug
+    the operator needs to fix, not something we paper over.
+    """
+    return Path(os.getcwd()).resolve() / ".env"
+
+
+def _read_env_bool(key: str, default: bool) -> bool:
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("true", "1", "t", "yes", "y")
+
+
+def _set_env_value(env_path: Path, key: str, value: str) -> None:
+    """Update or append ``KEY = 'VALUE'`` in .env.
+
+    Matches the existing single-quoted style install.sh writes. Quotes
+    and backslashes inside the value are forbidden — the only callers
+    here pass booleans and a validated HTTPS URL, so escaping isn't
+    needed and rejecting odd input is safer than encoding it.
+
+    Persistence goes through ``utils.env_check._atomic_replace_text``
+    which falls back to in-place truncate on Docker single-file bind
+    mounts (rename(2) over a mountpoint returns EBUSY/EXDEV).
+    """
+    if not _ENV_KEY_PATTERN.match(key):
+        raise ValueError(f"Refusing to write malformed env key: {key!r}")
+    if "'" in value or "\\" in value or "\n" in value:
+        raise ValueError("Refusing to write env value containing quote/backslash/newline")
+
+    new_line = f"{key} = '{value}'\n"
+    if not env_path.exists():
+        raise FileNotFoundError(f".env not found at {env_path}")
+
+    text = env_path.read_text()
+    lines = text.splitlines(keepends=True)
+    pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
+    found = False
+    for i, line in enumerate(lines):
+        if pattern.match(line):
+            lines[i] = new_line
+            found = True
+            break
+
+    if not found:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] = lines[-1] + "\n"
+        lines.append(new_line)
+
+    # Reuse the rotate_pepper helper: it already handles the Docker single-file
+    # bind-mount case (install-docker.sh maps ./.env:/app/.env, which makes
+    # /app/.env a mountpoint that rename(2) refuses to overwrite — EBUSY/EXDEV)
+    # plus Windows ERROR_ACCESS_DENIED retries. See issue #1337 for the user
+    # report on the admin MCP-settings save path.
+    _atomic_replace_text(str(env_path), "".join(lines))
+
+
+def _mcp_settings_payload() -> dict:
+    """Read the current MCP-related env values for the admin UI."""
+    public_url = (os.getenv("MCP_PUBLIC_URL") or "").rstrip("/")
+    http_enabled = _read_env_bool("MCP_HTTP_ENABLED", False)
+    return {
+        "http_enabled": http_enabled,
+        "public_url": public_url,
+        "mcp_url": f"{public_url}/mcp" if public_url else "",
+        "require_approval": _read_env_bool("MCP_OAUTH_REQUIRE_APPROVAL", False),
+        "write_scope_enabled": _read_env_bool("MCP_OAUTH_WRITE_SCOPE_ENABLED", True),
+    }
+
+
+@admin_bp.route("/api/mcp/settings", methods=["GET"])
+@check_session_validity
+@limiter.limit(API_RATE_LIMIT)
+def api_mcp_settings_get():
+    """Return the current MCP settings (master switch + posture toggles).
+
+    Always succeeds — works whether MCP is currently enabled or not, so
+    the admin UI can render the toggles in either state.
+    """
+    return jsonify({"status": "success", "settings": _mcp_settings_payload()})
+
+
+@admin_bp.route("/api/mcp/settings", methods=["PUT"])
+@check_session_validity
+@limiter.limit("30/minute")
+def api_mcp_settings_put():
+    """Update MCP settings in .env. Returns restart_required=True.
+
+    Validations are mirror images of the boot-time checks in app.py so
+    the operator can't save a config that would refuse to boot:
+      - http_enabled=True requires MCP_PUBLIC_URL set in .env
+      - http_enabled=True forbidden when FLASK_DEBUG=True (token leak risk)
+    """
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"status": "error", "message": "Body must be JSON object."}), 400
+
+    bool_keys = ("http_enabled", "require_approval", "write_scope_enabled")
+    for k in bool_keys:
+        if k in data and not isinstance(data[k], bool):
+            return jsonify({"status": "error", "message": f"{k} must be boolean."}), 400
+
+    public_url = data.get("public_url")
+    if public_url is not None:
+        if not isinstance(public_url, str):
+            return jsonify({"status": "error", "message": "public_url must be string."}), 400
+        public_url = public_url.strip().rstrip("/")
+        if public_url and not re.match(r"^https://[A-Za-z0-9.\-]+(:\d+)?(/.*)?$", public_url):
+            return jsonify(
+                {"status": "error", "message": "public_url must be HTTPS (e.g. https://yourdomain.com)."}
+            ), 400
+
+    # Pre-flight: enabling MCP must not produce a config that refuses to boot.
+    enabling = data.get("http_enabled") is True
+    if enabling:
+        if os.getenv("FLASK_DEBUG", "False").strip().lower() in ("true", "1", "t"):
+            return jsonify(
+                {
+                    "status": "error",
+                    "message": (
+                        "Cannot enable Remote MCP while FLASK_DEBUG=True — "
+                        "debug-mode tracebacks would leak bearer tokens. Disable FLASK_DEBUG first."
+                    ),
+                }
+            ), 400
+        effective_url = public_url if public_url is not None else (os.getenv("MCP_PUBLIC_URL") or "").strip()
+        if not effective_url:
+            return jsonify(
+                {
+                    "status": "error",
+                    "message": (
+                        "Cannot enable Remote MCP without MCP_PUBLIC_URL. "
+                        "Set the dashboard HTTPS origin (e.g. https://yourdomain.com) and try again."
+                    ),
+                }
+            ), 400
+
+    env_path = _resolve_env_path()
+    if not env_path.exists():
+        logger.error(f"[MCP admin] .env not found at {env_path}")
+        return jsonify(
+            {"status": "error", "message": f".env not found at {env_path}"}
+        ), 500
+
+    try:
+        if "http_enabled" in data:
+            _set_env_value(env_path, "MCP_HTTP_ENABLED", "True" if data["http_enabled"] else "False")
+        if public_url is not None:
+            _set_env_value(env_path, "MCP_PUBLIC_URL", public_url)
+        if "require_approval" in data:
+            _set_env_value(
+                env_path, "MCP_OAUTH_REQUIRE_APPROVAL", "True" if data["require_approval"] else "False"
+            )
+        if "write_scope_enabled" in data:
+            _set_env_value(
+                env_path,
+                "MCP_OAUTH_WRITE_SCOPE_ENABLED",
+                "True" if data["write_scope_enabled"] else "False",
+            )
+    except (FileNotFoundError, ValueError, OSError) as e:
+        logger.exception(f"[MCP admin] failed to update .env: {e}")
+        return jsonify({"status": "error", "message": f"Failed to update .env: {e}"}), 500
+
+    logger.info(
+        f"[MCP admin] .env updated: "
+        f"http_enabled={data.get('http_enabled', '?')} "
+        f"require_approval={data.get('require_approval', '?')} "
+        f"write_scope_enabled={data.get('write_scope_enabled', '?')}"
+    )
+    return jsonify(
+        {
+            "status": "success",
+            "restart_required": True,
+            "restart_command": "sudo systemctl restart openalgo",
+            "settings_pending": _mcp_settings_payload(),  # what's in .env now
+        }
+    )

@@ -110,7 +110,7 @@ generate_hex() {
 validate_broker() {
     local broker=$1
 
-    local valid_brokers="fivepaisa,fivepaisaxts,aliceblue,angel,compositedge,definedge,deltaexchange,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,ibulls,iifl,iiflcapital,indmoney,jainamxts,kotak,motilal,mstock,nubra,paytm,pocketful,rmoney,samco,shoonya,tradejini,upstox,wisdom,zebu,zerodha"
+    local valid_brokers="fivepaisa,fivepaisaxts,aliceblue,angel,arrow,compositedge,definedge,deltaexchange,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,hdfcsecurities,hdfcsky,ibulls,iifl,iiflcapital,indmoney,jainamxts,kotak,motilal,mstock,nubra,paytm,pocketful,rmoney,samco,shoonya,tradejini,tradesmart,upstox,wisdom,zebu,zerodha"
 
     if [[ ",$valid_brokers," == *",$broker,"* ]]; then
         return 0
@@ -367,7 +367,7 @@ done
 # Get broker name
 while true; do
 
-    log_message "\nValid brokers: fivepaisa,fivepaisaxts,aliceblue,angel,compositedge,definedge,deltaexchange,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,ibulls,iifl,iiflcapital,indmoney,jainamxts,kotak,motilal,mstock,nubra,paytm,pocketful,rmoney,samco,shoonya,tradejini,upstox,wisdom,zebu,zerodha" "$BLUE"
+    log_message "\nValid brokers: fivepaisa,fivepaisaxts,aliceblue,angel,arrow,compositedge,definedge,deltaexchange,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,hdfcsecurities,hdfcsky,ibulls,iifl,iiflcapital,indmoney,jainamxts,kotak,motilal,mstock,nubra,paytm,pocketful,rmoney,samco,shoonya,tradejini,tradesmart,upstox,wisdom,zebu,zerodha" "$BLUE"
 
     read -p "Enter your broker name: " BROKER_NAME
     if validate_broker "$BROKER_NAME"; then
@@ -415,18 +415,36 @@ if is_crypto_broker "$BROKER_NAME"; then
     DISABLE_SESSION_EXPIRY="true"
 fi
 
+# Optional: Remote MCP for hosted AI clients (Claude.ai, ChatGPT).
+# Same-domain mode — /mcp and /oauth/* are served from the same nginx
+# vhost as the dashboard, so the existing reverse-proxy config covers it.
+# Local stdio MCP (Claude Desktop / Cursor / Windsurf) works regardless.
+log_message "\nRemote MCP lets hosted AI clients (Claude.ai, ChatGPT) connect to OpenAlgo over HTTPS." "$BLUE"
+log_message "Skip this if you only use the local MCP server with Claude Desktop / Cursor." "$YELLOW"
+read -p "Enable Remote MCP? (y/N): " enable_mcp_input
+ENABLE_REMOTE_MCP="false"
+if [[ $enable_mcp_input =~ ^[Yy]$ ]]; then
+    ENABLE_REMOTE_MCP="true"
+    log_message "Remote MCP will be enabled at https://$DOMAIN/mcp" "$GREEN"
+fi
+
 # Generate random keys
 APP_KEY=$(generate_hex)
 API_KEY_PEPPER=$(generate_hex)
 
-# Installation paths with unique deployment name
-DEPLOY_NAME="${DOMAIN/./-}-${BROKER_NAME}"  # e.g., opendash-app-fyers
-BASE_PATH="/var/python/openalgo-flask/$DEPLOY_NAME"
-OPENALGO_PATH="$BASE_PATH/openalgo"
-VENV_PATH="$BASE_PATH/venv"
-SOCKET_PATH="$BASE_PATH"
+# Installation paths — single deployment per server. For 2+ deployments
+# side-by-side use install/install-multi.sh (different scheme).
+#
+#   App, venv, socket, .env all live under /var/python/openalgo
+#   systemd unit:  openalgo.service
+#   nginx vhost:   openalgo.conf
+DEPLOY_NAME="openalgo"
+OPENALGO_PATH="/var/python/openalgo"
+BASE_PATH="$OPENALGO_PATH"
+VENV_PATH="$OPENALGO_PATH/.venv"
+SOCKET_PATH="$OPENALGO_PATH"
 SOCKET_FILE="$SOCKET_PATH/openalgo.sock"
-SERVICE_NAME="openalgo-$DEPLOY_NAME"
+SERVICE_NAME="openalgo"
 
 # Set Nginx configuration paths based on OS
 case "$OS_TYPE" in
@@ -443,7 +461,7 @@ case "$OS_TYPE" in
         sudo mkdir -p "$NGINX_AVAILABLE"
         ;;
 esac
-NGINX_CONFIG_FILE="$NGINX_AVAILABLE/$DOMAIN.conf"
+NGINX_CONFIG_FILE="$NGINX_AVAILABLE/openalgo.conf"
 
 log_message "\nStarting OpenAlgo installation for $DEPLOY_NAME..." "$YELLOW"
 
@@ -567,7 +585,8 @@ esac
 log_message "\nInstalling uv package installer..." "$BLUE"
 case "$OS_TYPE" in
     ubuntu | debian | raspbian)
-        # Use snap for Ubuntu/Debian (native support)
+        UV_INSTALLED=false
+        # 1) Try snap first (native on Ubuntu/Debian)
         if command -v snap >/dev/null 2>&1; then
             if [ ! -e /snap ] && [ -d /var/lib/snapd/snap ]; then
                 sudo ln -s /var/lib/snapd/snap /snap
@@ -575,19 +594,47 @@ case "$OS_TYPE" in
             sleep 2
             if sudo snap install astral-uv --classic 2>/dev/null; then
                 log_message "uv installed via snap" "$GREEN"
+                UV_INSTALLED=true
             else
-                log_message "Snap installation failed, using pip fallback" "$YELLOW"
-                sudo $PYTHON_CMD -m pip install uv
+                log_message "Snap installation failed (snap store unreachable or astral-uv unavailable)" "$YELLOW"
             fi
-        else
-            sudo $PYTHON_CMD -m pip install uv
+        fi
+        # 2) Astral standalone installer — required on PEP 668 systems
+        #    (Ubuntu 24.04+, Debian 12+, Python 3.12+) where 'pip install'
+        #    refuses with externally-managed-environment. Installs a single
+        #    static binary to /usr/local/bin so it is on root's PATH for the
+        #    rest of this script and on every user's PATH for later use.
+        if [ "$UV_INSTALLED" = false ]; then
+            log_message "Installing uv via astral standalone installer..." "$BLUE"
+            if curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh; then
+                log_message "uv installed to /usr/local/bin" "$GREEN"
+                UV_INSTALLED=true
+            fi
+        fi
+        # 3) Last resort: pip with --break-system-packages (PEP 668 override).
+        if [ "$UV_INSTALLED" = false ]; then
+            log_message "Astral installer failed, using pip with --break-system-packages..." "$YELLOW"
+            sudo $PYTHON_CMD -m pip install --break-system-packages uv
+            UV_INSTALLED=true
         fi
         check_status "Failed to install uv"
         ;;
     centos | fedora | rhel | amzn)
-        # Use pip for RHEL (more reliable than snap)
-        log_message "Installing uv via pip for better compatibility..." "$BLUE"
-        sudo $PYTHON_CMD -m pip install uv
+        UV_INSTALLED=false
+        # Prefer astral standalone installer — works on PEP 668 systems
+        # (Fedora 38+, RHEL/Rocky/Alma 9+ with newer Python) and avoids the
+        # 'externally-managed-environment' error from system pip.
+        log_message "Installing uv via astral standalone installer..." "$BLUE"
+        if curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh; then
+            log_message "uv installed to /usr/local/bin" "$GREEN"
+            UV_INSTALLED=true
+        fi
+        # Fallback to pip with --break-system-packages.
+        if [ "$UV_INSTALLED" = false ]; then
+            log_message "Astral installer failed, using pip fallback..." "$YELLOW"
+            sudo $PYTHON_CMD -m pip install --break-system-packages uv
+            UV_INSTALLED=true
+        fi
         check_status "Failed to install uv"
         ;;
     arch)
@@ -678,7 +725,15 @@ check_status "Failed to create base directory"
 
 # Clone repository
 log_message "\nCloning OpenAlgo repository..." "$BLUE"
-sudo git clone https://github.com/marketcalls/openalgo.git $OPENALGO_PATH
+# --filter=blob:none makes this a partial clone: the server sends every
+# commit and tree but no file contents, so it pulls ~20 MB instead of
+# ~280 MB. Blobs outside the current checkout are fetched on demand, so
+# the full history stays usable -- all 4,824 commits, 62 tags, every
+# branch -- which keeps `git reset --hard HEAD~n`, tag checkouts and
+# branch switching working. Nearly all of that 280 MB is superseded
+# frontend/dist bundles that a server never reads. A host without filter
+# support just full-clones, so this is never worse than no flag at all.
+sudo git clone --filter=blob:none https://github.com/marketcalls/openalgo.git $OPENALGO_PATH
 check_status "Failed to clone OpenAlgo repository"
 
 # Create virtual environment using uv
@@ -764,6 +819,17 @@ fi
 # Update WebSocket URL for production
 sudo sed -i "s|WEBSOCKET_URL='.*'|WEBSOCKET_URL='wss://$DOMAIN/ws'|g" $OPENALGO_PATH/.env
 
+# Enable Remote MCP if the operator opted in. Same-domain mode: /mcp and
+# /oauth/* are served from the same nginx vhost as the dashboard, no
+# extra config needed. Other MCP_* keys (auto-approve, write scope, CORS
+# allowlist) inherit their defaults from .sample.env — flip them later
+# in .env if you want stricter behavior on a shared deployment.
+if [ "$ENABLE_REMOTE_MCP" = "true" ]; then
+    sudo sed -i "s|MCP_HTTP_ENABLED = 'False'|MCP_HTTP_ENABLED = 'True'|g" $OPENALGO_PATH/.env
+    sudo sed -i "s|MCP_PUBLIC_URL = ''|MCP_PUBLIC_URL = 'https://$DOMAIN'|g" $OPENALGO_PATH/.env
+    log_message "Remote MCP enabled at https://$DOMAIN/mcp" "$GREEN"
+fi
+
 # Host bindings intentionally left at 127.0.0.1 (the .sample.env default):
 # - nginx on this host reverse-proxies /ws -> 127.0.0.1:WEBSOCKET_PORT, so the
 #   WebSocket server does not need to listen on all interfaces.
@@ -792,6 +858,13 @@ server {
     listen [::]:80;
     server_name $DOMAIN;
     root /var/www/html;
+
+    # OPENALGO_WEBHOOK_LOG_GUARD: URL credentials never enter nginx access logs.
+    set \$openalgo_loggable 1;
+    if (\$uri ~ ^/(strategy|flow|chartink)/webhook/) {
+        set \$openalgo_loggable 0;
+    }
+    access_log /var/log/nginx/${DOMAIN}_access.log combined if=\$openalgo_loggable;
     
     location / {
         try_files \$uri \$uri/ =404;
@@ -892,10 +965,13 @@ fi
 
 # Configure final Nginx setup with SSL and socket
 log_message "\nConfiguring final Nginx setup..." "$BLUE"
-# Remove old config files to ensure clean write (with and without .conf extension)
+# Remove the existing openalgo nginx config and any legacy domain-keyed
+# files left over from older installs (pre-simple-paths) so the rewrite
+# below leaves exactly one openalgo vhost on disk.
 sudo rm -f $NGINX_CONFIG_FILE
-sudo rm -f ${NGINX_AVAILABLE}/${DOMAIN}
+sudo rm -f ${NGINX_AVAILABLE}/${DOMAIN} ${NGINX_AVAILABLE}/${DOMAIN}.conf
 if [ "$NGINX_CONFIG_MODE" = "sites" ]; then
+    sudo rm -f /etc/nginx/sites-enabled/openalgo.conf
     sudo rm -f /etc/nginx/sites-enabled/${DOMAIN}
     sudo rm -f /etc/nginx/sites-enabled/${DOMAIN}.conf
 fi
@@ -905,6 +981,13 @@ server {
     listen 80;
     listen [::]:80;
     server_name $DOMAIN;
+
+    # OPENALGO_WEBHOOK_LOG_GUARD: suppress URL-secret routes before redirect logs.
+    set \$openalgo_loggable 1;
+    if (\$uri ~ ^/(strategy|flow|chartink)/webhook/) {
+        set \$openalgo_loggable 0;
+    }
+    access_log /var/log/nginx/${DOMAIN}_access.log combined if=\$openalgo_loggable;
 
     # WebSocket path exceptions to avoid 301 redirect loop
     location = /ws {
@@ -926,6 +1009,13 @@ server {
     listen [::]:443 ssl;
     
     server_name $DOMAIN;
+
+    # OPENALGO_WEBHOOK_LOG_GUARD: URL credentials never enter nginx access logs.
+    set \$openalgo_loggable 1;
+    if (\$uri ~ ^/(strategy|flow|chartink)/webhook/) {
+        set \$openalgo_loggable 0;
+    }
+    access_log /var/log/nginx/${DOMAIN}_access.log combined if=\$openalgo_loggable;
     
     ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
@@ -1034,8 +1124,12 @@ server {
         proxy_buffers 4 256k;
         proxy_busy_buffers_size 256k;
 
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        # Plain HTTP only: /ws, /ws/ and /socket.io/ have their own blocks.
+        # Forcing "Connection: upgrade" here sent every ordinary request
+        # upstream with a bogus upgrade header and an empty Upgrade:, which
+        # breaks HTTP/1.1 keep-alive to gunicorn and shows up as intermittent
+        # truncated asset responses and 5xx (GitHub issue #1807).
+        proxy_set_header Connection "";
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -1197,6 +1291,11 @@ if [ "$DISABLE_SESSION_EXPIRY" = "true" ]; then
     log_message "Auto-Logout: Disabled (24/7 crypto market)" "$BLUE"
 else
     log_message "Auto-Logout: Enabled (3 AM IST daily)" "$BLUE"
+fi
+if [ "$ENABLE_REMOTE_MCP" = "true" ]; then
+    log_message "Remote MCP: Enabled at https://$DOMAIN/mcp" "$BLUE"
+else
+    log_message "Remote MCP: Disabled" "$BLUE"
 fi
 log_message "Installation Log: $LOG_FILE" "$BLUE"
 

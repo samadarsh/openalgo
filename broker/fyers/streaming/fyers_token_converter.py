@@ -10,6 +10,8 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 
+from utils.logging import get_logger
+
 # Import database functions
 try:
     from database.token_db import get_br_symbol
@@ -62,7 +64,7 @@ class FyersTokenConverter:
         Args:
             access_token: Fyers access token (can be in format "appid:token")
         """
-        self.logger = logging.getLogger("fyers_token_converter")
+        self.logger = get_logger("fyers_token_converter")
 
         # Store full access token for API calls
         self.access_token = access_token
@@ -215,11 +217,11 @@ class FyersTokenConverter:
                             if hsm_token:
                                 hsm_tokens.append(hsm_token)
                                 token_mappings[hsm_token] = symbol
-                                # self.logger.info(f"✅ Converted: {symbol} -> {hsm_token} (fytoken: {fytoken})")
+                                # self.logger.info(f"Converted: {symbol} -> {hsm_token} (fytoken: {fytoken})")
                             else:
                                 invalid_symbols.append(symbol)
                                 self.logger.warning(
-                                    f"❌ Failed to convert: {symbol} with fytoken: {fytoken}"
+                                    f"Failed to convert: {symbol} with fytoken: {fytoken}"
                                 )
 
                         # Add API invalid symbols

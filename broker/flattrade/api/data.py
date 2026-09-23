@@ -9,9 +9,15 @@ from datetime import datetime, timedelta
 import httpx
 import pandas as pd
 
+from broker.flattrade.api.rate_limit import (
+    DATA_LIMITER,
+    is_rate_limit_error,
+    rate_limit_retry_delay,
+)
 from database.token_db import get_br_symbol, get_oa_symbol, get_token
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
+
 
 # Auto-detect eventlet environment (Docker/standalone uses gunicorn+eventlet)
 # asyncio.run() cannot be called under eventlet's monkey-patched event loop
@@ -26,11 +32,26 @@ USE_ASYNC = not _is_eventlet_patched()
 
 logger = get_logger(__name__)
 
+# Request pacing for Flattrade data APIs (issue #1663).
+#
+# The dual sliding-window limiter now lives in broker/flattrade/api/rate_limit.py
+# so that order_api.py, funds.py and margin_api.py share the same windows — they
+# previously issued unpaced requests against the same account, which meant the
+# window this module maintained was never the whole picture (issue #1806).
+# Module-level aliases are kept so the existing call sites below read unchanged.
+_apply_rate_limit = DATA_LIMITER.acquire
+_apply_rate_limit_async = DATA_LIMITER.acquire_async
+_is_rate_limit_error = is_rate_limit_error
 
-def get_api_response(endpoint, auth, method="POST", payload=None):
+
+def get_api_response(endpoint, auth, method="POST", payload=None, retry_count=0):
     """
-    Common function to make API calls to Flattrade using httpx with connection pooling
+    Common function to make API calls to Flattrade using httpx with connection pooling.
+    Applies global rate limiting and retries with exponential backoff on rate-limit errors.
     """
+    # Apply rate limiting before making the request
+    _apply_rate_limit()
+
     AUTH_TOKEN = auth
     full_api_key = os.getenv("BROKER_API_KEY")
     api_key = full_api_key.split(":::")[0]
@@ -57,11 +78,21 @@ def get_api_response(endpoint, auth, method="POST", payload=None):
     logger.info(f"Raw Response: {data}")
 
     try:
-        return json.loads(data)
+        parsed = json.loads(data)
     except json.JSONDecodeError as e:
         logger.error(f"Error decoding JSON: {e}")
         logger.info(f"Response data: {data}")
         raise
+
+    # Clamp to whatever ceiling the rejection names, then retry, so the retry is
+    # not just a slower repeat of a request this account was never provisioned
+    # to make.
+    retry_delay = rate_limit_retry_delay(parsed, DATA_LIMITER, retry_count, endpoint)
+    if retry_delay is not None:
+        time.sleep(retry_delay)
+        return get_api_response(endpoint, auth, method, payload, retry_count + 1)
+
+    return parsed
 
 
 class BrokerData:
@@ -144,10 +175,20 @@ class BrokerData:
                   [{'symbol': 'SBIN', 'exchange': 'NSE', 'data': {...}}, ...]
         """
         try:
-            # Flattrade API rate limits: 10 requests/second
-            # Process one symbol at a time since API doesn't support batching
-            BATCH_SIZE = 10  # Process 10 symbols per batch (matches rate limit per second)
-            RATE_LIMIT_DELAY = 1.1  # 1.1 second delay between batches for safety margin
+            # Flattrade has no bulk-quote endpoint, so this is one GetQuotes call
+            # per symbol. Chunking keeps the in-flight fan-out bounded; the
+            # PACING is owned by DATA_LIMITER, not by this loop.
+            #
+            # There used to be a fixed 1.1s sleep between chunks as a "safety
+            # margin". It was doing more harm than good once the shared limiter
+            # landed: it is per-invocation, so it cannot see the OTHER option
+            # chain fetches running concurrently (the live log for 2026-09-01
+            # shows three 42-symbol fetches starting at 11:16:41, :44 and :49
+            # before any of them finished), while the limiter's rolling window is
+            # global and does bound them together. All the sleep added was ~4.4s
+            # of latency per call, which pushed each response out far enough for
+            # the next refresh to pile on top of it.
+            BATCH_SIZE = 10
 
             if len(symbols) > BATCH_SIZE:
                 logger.info(f"Processing {len(symbols)} symbols in batches of {BATCH_SIZE}")
@@ -162,10 +203,6 @@ class BrokerData:
                     batch_results = self._process_quotes_batch(batch)
                     all_results.extend(batch_results)
 
-                    # Rate limit delay between batches
-                    if i + BATCH_SIZE < len(symbols):
-                        time.sleep(RATE_LIMIT_DELAY)
-
                 logger.info(
                     f"Successfully processed {len(all_results)} quotes in {(len(symbols) + BATCH_SIZE - 1) // BATCH_SIZE} batches"
                 )
@@ -178,23 +215,46 @@ class BrokerData:
             raise Exception(f"Error fetching multiquotes: {e}")
 
     def _fetch_single_quote_sync(
-        self, symbol: str, exchange: str, api_exchange: str, token: str, api_key: str
+        self,
+        symbol: str,
+        exchange: str,
+        api_exchange: str,
+        token: str,
+        api_key: str,
+        retry_count: int = 0,
     ) -> dict:
         """
-        Fetch quote for a single symbol synchronously (for ThreadPoolExecutor)
+        Fetch quote for a single symbol synchronously (for ThreadPoolExecutor).
+        Honors the global rate limiter and retries with exponential backoff on rate-limit errors.
         """
         try:
+            # Serialize through the shared rate limiter
+            _apply_rate_limit()
+
             data = {"uid": api_key, "actid": api_key, "exch": api_exchange, "token": token}
 
             payload_str = "jData=" + json.dumps(data) + "&jKey=" + self.auth_token
             headers = {"Content-Type": "application/x-www-form-urlencoded"}
             url = "https://piconnect.flattrade.in/PiConnectAPI/GetQuotes"
 
-            # Use httpx.post for sync requests
-            http_response = httpx.post(url, content=payload_str, headers=headers, timeout=10.0)
+            # Shared pooled client rather than a bare httpx.post: this runs once
+            # per symbol under a ThreadPoolExecutor, so a per-call connection is
+            # a socket churned for every quote in the batch.
+            http_response = get_httpx_client().post(
+                url, content=payload_str, headers=headers, timeout=10.0
+            )
             response = http_response.json()
 
             if response.get("stat") != "Ok":
+                # Retry on rate-limit error
+                retry_delay = rate_limit_retry_delay(
+                    response, DATA_LIMITER, retry_count, f"{symbol}@{exchange}"
+                )
+                if retry_delay is not None:
+                    time.sleep(retry_delay)
+                    return self._fetch_single_quote_sync(
+                        symbol, exchange, api_exchange, token, api_key, retry_count + 1
+                    )
                 return {
                     "symbol": symbol,
                     "exchange": exchange,
@@ -229,11 +289,16 @@ class BrokerData:
         api_exchange: str,
         token: str,
         api_key: str,
+        retry_count: int = 0,
     ) -> dict:
         """
-        Fetch quote for a single symbol asynchronously
+        Fetch quote for a single symbol asynchronously.
+        Honors the global rate limiter and retries with exponential backoff on rate-limit errors.
         """
         try:
+            # Serialize through the shared rate limiter (async-safe sleep)
+            await _apply_rate_limit_async()
+
             data = {"uid": api_key, "actid": api_key, "exch": api_exchange, "token": token}
 
             payload_str = "jData=" + json.dumps(data) + "&jKey=" + self.auth_token
@@ -245,6 +310,15 @@ class BrokerData:
             response = http_response.json()
 
             if response.get("stat") != "Ok":
+                # Retry on rate-limit error
+                retry_delay = rate_limit_retry_delay(
+                    response, DATA_LIMITER, retry_count, f"{symbol}@{exchange}"
+                )
+                if retry_delay is not None:
+                    await asyncio.sleep(retry_delay)
+                    return await self._fetch_single_quote_async(
+                        client, symbol, exchange, api_exchange, token, api_key, retry_count + 1
+                    )
                 logger.warning(
                     f"Error fetching quote for {symbol}@{exchange}: {response.get('emsg', 'Unknown error')}"
                 )

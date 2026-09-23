@@ -50,7 +50,7 @@ generate_hex() {
 # Function to validate broker name
 validate_broker() {
     local broker=$1
-    local valid_brokers="fivepaisa,fivepaisaxts,aliceblue,angel,compositedge,definedge,deltaexchange,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,ibulls,iifl,iiflcapital,indmoney,jainamxts,kotak,motilal,mstock,nubra,paytm,pocketful,rmoney,samco,shoonya,tradejini,upstox,wisdom,zebu,zerodha"
+    local valid_brokers="fivepaisa,fivepaisaxts,aliceblue,angel,arrow,compositedge,definedge,deltaexchange,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,hdfcsecurities,hdfcsky,ibulls,iifl,iiflcapital,indmoney,jainamxts,kotak,motilal,mstock,nubra,paytm,pocketful,rmoney,samco,shoonya,tradejini,tradesmart,upstox,wisdom,zebu,zerodha"
 
     if [[ ",$valid_brokers," == *",$broker,"* ]]; then
         return 0
@@ -106,7 +106,7 @@ while true; do
     if [[ "$INSTANCES" =~ ^[0-9]+$ ]] && [ "$INSTANCES" -gt 0 ]; then
         break
     else
-        log_message "❌ Invalid number. Please enter a positive integer." "$RED"
+        log_message "Invalid number. Please enter a positive integer." "$RED"
     fi
 done
 
@@ -127,6 +127,7 @@ declare -a API_SECRETS
 declare -a API_KEYS_MARKET
 declare -a API_SECRETS_MARKET
 declare -a IS_XTS
+declare -a MCP_ENABLED_LIST
 
 # Collect information for all instances
 log_message "\n=== COLLECTING INSTANCE CONFIGURATIONS ===" "$YELLOW"
@@ -152,7 +153,7 @@ for ((i=1; i<=INSTANCES; i++)); do
 
     # Get broker
     while true; do
-        log_message "\nValid brokers: fivepaisa,fivepaisaxts,aliceblue,angel,compositedge,definedge,deltaexchange,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,ibulls,iifl,indmoney,jainamxts,kotak,motilal,mstock,nubra,paytm,pocketful,rmoney,samco,shoonya,tradejini,upstox,wisdom,zebu,zerodha" "$BLUE"
+        log_message "\nValid brokers: fivepaisa,fivepaisaxts,aliceblue,angel,arrow,compositedge,definedge,deltaexchange,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,hdfcsecurities,hdfcsky,ibulls,iifl,iiflcapital,indmoney,jainamxts,kotak,motilal,mstock,nubra,paytm,pocketful,rmoney,samco,shoonya,tradejini,tradesmart,upstox,wisdom,zebu,zerodha" "$BLUE"
         read -p "Enter broker name for instance $i: " broker
         if validate_broker "$broker"; then
             BROKERS+=("$broker")
@@ -198,7 +199,21 @@ for ((i=1; i<=INSTANCES; i++)); do
         API_SECRETS_MARKET+=("")
     fi
 
-    log_message "✅ Instance $i configuration collected" "$GREEN"
+    # Optional: Remote MCP for hosted AI clients (Claude.ai, ChatGPT).
+    # Same-domain mode — /mcp and /oauth/* are served from the same nginx
+    # vhost as this instance's dashboard, so no extra config is required.
+    # Local stdio MCP (Claude Desktop / Cursor / Windsurf) works regardless.
+    log_message "\nRemote MCP lets hosted AI clients (Claude.ai, ChatGPT) connect to OpenAlgo over HTTPS." "$BLUE"
+    log_message "Skip this if you only use the local MCP server with Claude Desktop / Cursor." "$YELLOW"
+    read -p "Enable Remote MCP for instance $i? (y/N): " enable_mcp_input
+    if [[ $enable_mcp_input =~ ^[Yy]$ ]]; then
+        MCP_ENABLED_LIST+=("true")
+        log_message "Remote MCP will be enabled at https://$domain/mcp" "$GREEN"
+    else
+        MCP_ENABLED_LIST+=("false")
+    fi
+
+    log_message "Instance $i configuration collected" "$GREEN"
 done
 
 # System packages installation (one-time)
@@ -253,6 +268,7 @@ for ((i=1; i<=INSTANCES; i++)); do
     API_KEY_MARKET="${API_KEYS_MARKET[$idx]}"
     API_SECRET_MARKET="${API_SECRETS_MARKET[$idx]}"
     IS_XTS_INSTANCE="${IS_XTS[$idx]}"
+    ENABLE_REMOTE_MCP="${MCP_ENABLED_LIST[$idx]}"
 
     log_message "\n--- Installing Instance $i: $DOMAIN ($BROKER) ---" "$BLUE"
 
@@ -270,11 +286,19 @@ for ((i=1; i<=INSTANCES; i++)); do
 
     # Clone or update repository
     if [ ! -d "$INSTANCE_DIR" ]; then
-        log_message "📥 Cloning repository to $INSTANCE_DIR" "$BLUE"
-        sudo git clone "$REPO_URL" "$INSTANCE_DIR"
+        log_message "Cloning repository to $INSTANCE_DIR" "$BLUE"
+        # --filter=blob:none makes this a partial clone: the server sends every
+        # commit and tree but no file contents, so it pulls ~20 MB instead of
+        # ~280 MB. Blobs outside the current checkout are fetched on demand, so
+        # the full history stays usable -- all 4,824 commits, 62 tags, every
+        # branch -- which keeps `git reset --hard HEAD~n`, tag checkouts and
+        # branch switching working. Nearly all of that 280 MB is superseded
+        # frontend/dist bundles that a server never reads. A host without filter
+        # support just full-clones, so this is never worse than no flag at all.
+        sudo git clone --filter=blob:none "$REPO_URL" "$INSTANCE_DIR"
         check_status "Failed to clone repository"
     else
-        log_message "⚠️ Directory exists, skipping clone" "$YELLOW"
+        log_message "Directory exists, skipping clone" "$YELLOW"
     fi
 
     # Create virtual environment
@@ -371,6 +395,16 @@ for ((i=1; i<=INSTANCES; i++)); do
     # 10. Update Flask host IP binding (internal only)
     sudo sed -i "s|FLASK_HOST_IP='.*'|FLASK_HOST_IP='127.0.0.1'|g" "$ENV_FILE"
 
+    # 11. Enable Remote MCP if the operator opted in for this instance.
+    # Same-domain mode: /mcp and /oauth/* are served from the same nginx
+    # vhost as the dashboard. Other MCP_* keys (auto-approve, write scope,
+    # CORS allowlist) inherit their defaults from .sample.env — flip them
+    # later in the per-instance .env if you want stricter behavior.
+    if [ "$ENABLE_REMOTE_MCP" = "true" ]; then
+        sudo sed -i "s|MCP_HTTP_ENABLED = 'False'|MCP_HTTP_ENABLED = 'True'|g" "$ENV_FILE"
+        sudo sed -i "s|MCP_PUBLIC_URL = ''|MCP_PUBLIC_URL = 'https://$DOMAIN'|g" "$ENV_FILE"
+    fi
+
     # XTS broker credentials
     if [ "$IS_XTS_INSTANCE" = "true" ]; then
         sudo sed -i "s|YOUR_BROKER_MARKET_API_KEY|$API_KEY_MARKET|g" "$ENV_FILE"
@@ -406,6 +440,13 @@ server {
     server_name $DOMAIN;
     root /var/www/html;
 
+    # OPENALGO_WEBHOOK_LOG_GUARD: URL credentials never enter nginx access logs.
+    set \$openalgo_loggable 1;
+    if (\$uri ~ ^/(strategy|flow|chartink)/webhook/) {
+        set \$openalgo_loggable 0;
+    }
+    access_log /var/log/nginx/${DOMAIN}_access.log combined if=\$openalgo_loggable;
+
     location / {
         try_files \$uri \$uri/ =404;
     }
@@ -436,6 +477,13 @@ server {
     listen [::]:80;
     server_name $DOMAIN;
 
+    # OPENALGO_WEBHOOK_LOG_GUARD: suppress URL-secret routes before redirect logs.
+    set \$openalgo_loggable 1;
+    if (\$uri ~ ^/(strategy|flow|chartink)/webhook/) {
+        set \$openalgo_loggable 0;
+    }
+    access_log /var/log/nginx/${DOMAIN}_access.log combined if=\$openalgo_loggable;
+
     # WebSocket redirect exceptions
     location = /ws {
         return 301 https://\$host\$request_uri;
@@ -455,6 +503,13 @@ server {
     listen [::]:443 ssl;
 
     server_name $DOMAIN;
+
+    # OPENALGO_WEBHOOK_LOG_GUARD: URL credentials never enter nginx access logs.
+    set \$openalgo_loggable 1;
+    if (\$uri ~ ^/(strategy|flow|chartink)/webhook/) {
+        set \$openalgo_loggable 0;
+    }
+    access_log /var/log/nginx/${DOMAIN}_access.log combined if=\$openalgo_loggable;
 
     ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
@@ -535,8 +590,12 @@ server {
         proxy_buffers 4 256k;
         proxy_busy_buffers_size 256k;
 
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        # Plain HTTP only: /ws, /ws/ and /socket.io/ have their own blocks.
+        # Forcing "Connection: upgrade" here sent every ordinary request
+        # upstream with a bogus upgrade header and an empty Upgrade:, which
+        # breaks HTTP/1.1 keep-alive to gunicorn and shows up as intermittent
+        # truncated asset responses and 5xx (GitHub issue #1807).
+        proxy_set_header Connection "";
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -598,10 +657,15 @@ EOL
     sudo systemctl start $SERVICE_NAME
     check_status "Failed to start service"
 
-    log_message "✅ Instance $i installed successfully!" "$GREEN"
+    log_message "Instance $i installed successfully!" "$GREEN"
     log_message "   URL: https://$DOMAIN" "$BLUE"
     log_message "   Flask:$FLASK_PORT | WS:$WS_PORT | ZMQ:$ZMQ_PORT" "$BLUE"
     log_message "   Service: $SERVICE_NAME" "$BLUE"
+    if [ "$ENABLE_REMOTE_MCP" = "true" ]; then
+        log_message "   Remote MCP: Enabled at https://$DOMAIN/mcp" "$BLUE"
+    else
+        log_message "   Remote MCP: Disabled" "$BLUE"
+    fi
 done
 
 # Final Nginx reload
@@ -613,7 +677,7 @@ log_message "\n╔════════════════════�
 log_message "║          MULTI-INSTANCE INSTALLATION COMPLETE          ║" "$GREEN"
 log_message "╚════════════════════════════════════════════════════════╝" "$GREEN"
 
-log_message "\n📋 INSTANCE SUMMARY:" "$YELLOW"
+log_message "\n INSTANCE SUMMARY:" "$YELLOW"
 for ((i=1; i<=INSTANCES; i++)); do
     idx=$((i-1))
     log_message "\nInstance $i:" "$BLUE"
@@ -621,13 +685,18 @@ for ((i=1; i<=INSTANCES; i++)); do
     log_message "  Broker: ${BROKERS[$idx]}" "$BLUE"
     log_message "  Service: openalgo$i" "$BLUE"
     log_message "  Directory: $BASE_DIR/openalgo$i" "$BLUE"
+    if [ "${MCP_ENABLED_LIST[$idx]}" = "true" ]; then
+        log_message "  Remote MCP: Enabled at https://${DOMAINS[$idx]}/mcp" "$BLUE"
+    else
+        log_message "  Remote MCP: Disabled" "$BLUE"
+    fi
 done
 
-log_message "\n📚 USEFUL COMMANDS:" "$YELLOW"
+log_message "\n USEFUL COMMANDS:" "$YELLOW"
 log_message "View all services: systemctl list-units 'openalgo*'" "$BLUE"
 log_message "Restart instance: sudo systemctl restart openalgo<N>" "$BLUE"
 log_message "View logs: sudo journalctl -u openalgo<N> -f" "$BLUE"
 log_message "Check status: sudo systemctl status openalgo<N>" "$BLUE"
 
-log_message "\n📝 Installation log saved to: $LOG_FILE" "$BLUE"
-log_message "\n🎉 All instances are ready to use!" "$GREEN"
+log_message "\n Installation log saved to: $LOG_FILE" "$BLUE"
+log_message "\n All instances are ready to use!" "$GREEN"

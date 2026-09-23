@@ -1,5 +1,4 @@
 import importlib
-from typing import Dict, Optional, Type
 
 from utils.logging import get_logger
 
@@ -73,7 +72,7 @@ def _get_adapter_class(broker_name: str) -> type[BaseBrokerWebSocketAdapter]:
 
     except (ImportError, AttributeError) as e:
         logger.exception(f"Failed to load adapter for broker {broker_name}: {e}")
-        raise ValueError(f"Unsupported broker: {broker_name}. No adapter available.")
+        raise ValueError(f"Unsupported broker: {broker_name}. No adapter available.") from e
 
 
 def create_broker_adapter(
@@ -197,7 +196,8 @@ class _PooledAdapterWrapper:
     def unsubscribe_all(self):
         """Unsubscribe from all symbols"""
         if self._pool:
-            self._pool.unsubscribe_all()
+            return self._pool.unsubscribe_all()
+        return {"status": "error", "message": "Not initialized"}
 
     def get_stats(self) -> dict:
         """Get pool statistics"""
@@ -321,6 +321,56 @@ def cleanup_all_pools():
         except Exception as e:
             logger.exception(f"Error cleaning up pool {pool_key}: {e}")
     _POOLED_ADAPTERS.clear()
+
+
+def cleanup_pools_for_user(user_id: str, broker_name: str | None = None) -> int:
+    """Tear down cached connection pools tied to ``user_id``.
+
+    Called by ``database.auth_db.upsert_auth`` whenever fresh broker
+    credentials are persisted (login, re-login, token refresh). Without this
+    targeted invalidation, the next websocket connect re-uses the cached
+    pool from before the auth refresh — which still holds the stale token
+    that initialised it — and the user sees ``Adapter initialization
+    failed: No authentication token found`` until they restart the whole
+    process. See marketcalls/openalgo#1394 for the user-visible symptom.
+
+    Args:
+        user_id: OpenAlgo username whose pools should be discarded.
+        broker_name: Optional. When set, only that broker's pool is
+            discarded; otherwise every pool keyed by this user is purged.
+
+    Returns:
+        Count of pools removed.
+    """
+    if not user_id:
+        return 0
+
+    targets: list[str] = []
+    suffix = f"_{user_id}"
+    for pool_key in list(_POOLED_ADAPTERS.keys()):
+        if not pool_key.endswith(suffix):
+            continue
+        if broker_name is not None and not pool_key.startswith(f"{broker_name}_"):
+            continue
+        targets.append(pool_key)
+
+    for pool_key in targets:
+        pool = _POOLED_ADAPTERS.pop(pool_key, None)
+        if pool is None:
+            continue
+        try:
+            pool.disconnect()
+        except Exception as e:
+            # Best-effort: even if disconnect raises, the pool is already
+            # detached from the registry so the next connect rebuilds.
+            logger.warning(f"Error disconnecting pool {pool_key} during invalidation: {e}")
+
+    if targets:
+        logger.info(
+            f"Invalidated {len(targets)} cached pool(s) for user={user_id}"
+            + (f" broker={broker_name}" if broker_name else "")
+        )
+    return len(targets)
 
 
 def get_resource_health() -> dict:

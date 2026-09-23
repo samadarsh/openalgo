@@ -48,7 +48,7 @@ BROKER_API_SECRET_MARKET = '${BROKER_API_SECRET_MARKET:-}'
 REDIRECT_URL = '${REDIRECT_URL}'
 
 # Valid Brokers Configuration
-VALID_BROKERS = '${VALID_BROKERS:-fivepaisa,fivepaisaxts,aliceblue,angel,compositedge,definedge,deltaexchange,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,ibulls,iifl,iiflcapital,indmoney,jainamxts,kotak,motilal,mstock,nubra,paytm,pocketful,rmoney,samco,shoonya,tradejini,upstox,wisdom,zebu,zerodha}'
+VALID_BROKERS = '${VALID_BROKERS:-fivepaisa,fivepaisaxts,aliceblue,angel,arrow,compositedge,definedge,deltaexchange,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,hdfcsecurities,hdfcsky,ibulls,iifl,iiflcapital,indmoney,jainamxts,kotak,motilal,mstock,nubra,paytm,pocketful,rmoney,samco,shoonya,tradejini,tradesmart,upstox,wisdom,zebu,zerodha}'
 
 # Security Configuration
 APP_KEY = '${APP_KEY}'
@@ -180,11 +180,11 @@ done
 # This will work for local directories but skip for mounted volumes
 if [ -w "." ]; then
     # Set more permissive permissions for directories
-    chmod -R 755 db log strategies 2>/dev/null || echo "⚠️  Skipping chmod (may be mounted volume or permission restricted)"
+    chmod -R 755 db log strategies 2>/dev/null || echo "Skipping chmod (may be mounted volume or permission restricted)"
     # Set restrictive permissions for keys directory (only owner can access)
     chmod 700 keys 2>/dev/null || true
 else
-    echo "⚠️  Running with restricted permissions (mounted volume detected)"
+    echo "Running with restricted permissions (mounted volume detected)"
 fi
 
 # Ensure Python can create directories at runtime if needed
@@ -291,7 +291,10 @@ fi
 # Run migrations automatically on startup (idempotent - safe to run multiple times)
 if [ -f "/app/upgrade/migrate_all.py" ]; then
     echo "[OpenAlgo] Running database migrations..."
-    /app/.venv/bin/python /app/upgrade/migrate_all.py || echo "[OpenAlgo] Migration completed (some may have been skipped)"
+    if ! /app/.venv/bin/python /app/upgrade/migrate_all.py; then
+        echo "[OpenAlgo] Database migrations failed; startup aborted."
+        exit 1
+    fi
 else
     echo "[OpenAlgo] No migrations found, skipping..."
 fi

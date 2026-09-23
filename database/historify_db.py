@@ -240,19 +240,10 @@ def init_database():
             )
         """)
 
-        # Create indexes for common query patterns
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_market_data_timestamp
-            ON market_data (timestamp)
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_market_data_exchange_time
-            ON market_data (exchange, timestamp)
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_market_data_interval_time
-            ON market_data (interval, timestamp)
-        """)
+        # No secondary indexes on market_data: every query leads with
+        # `symbol`, DuckDB serves range scans from per-row-group zone maps,
+        # and ART index memory stays fully resident as the table grows,
+        # which OOMs large 1m backfills. See #1779.
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_job_items_job_id
             ON job_items (job_id)
@@ -1516,7 +1507,14 @@ def vacuum_database():
 
 
 # Supported exchanges (these are static across brokers)
-SUPPORTED_EXCHANGES = ["NSE", "BSE", "NFO", "BFO", "MCX", "CDS", "BCD", "NSE_INDEX", "BSE_INDEX", "CRYPTO"]
+# Keep aligned with utils/constants.VALID_EXCHANGES — Historify must accept any
+# exchange the platform validates as legal, otherwise /history download/upload
+# rejects symbols that the live /quote and /history-API paths happily serve.
+SUPPORTED_EXCHANGES = [
+    "NSE", "BSE", "NFO", "BFO", "MCX", "CDS", "BCD", "NCO",
+    "NSE_INDEX", "BSE_INDEX", "MCX_INDEX", "GLOBAL_INDEX",
+    "CRYPTO",
+]
 
 
 def get_supported_intervals(api_key: str) -> list[str]:

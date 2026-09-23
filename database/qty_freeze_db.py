@@ -6,14 +6,14 @@ Handles freeze quantity limits for F&O instruments.
 Freeze quantity is the maximum order quantity allowed in a single order.
 Orders exceeding this limit need to be split.
 
-Currently supports:
-- NFO: Actual freeze quantities from NSE
-- BFO, CDS, MCX: Default value of 1 (to be implemented later)
+Freeze quantities are admin-managed per exchange + underlying (NFO seeded from
+NSE's qtyfreeze.csv; BFO/CDS/MCX and others added via the Freeze Quantities page
+or a CSV upload). Any F&O exchange with a configured entry is honored; symbols
+without an entry return 0, meaning no limit is known and none is enforced.
 """
 
 import csv
 import os
-from typing import Dict, Optional
 
 from sqlalchemy import Column, Index, Integer, String, create_engine
 from sqlalchemy.ext.declarative import declarative_base
@@ -159,15 +159,23 @@ def get_freeze_qty(symbol: str, exchange: str) -> int:
     Get freeze quantity for a symbol.
     Uses in-memory cache for fast lookups.
 
-    For NFO: Returns actual freeze quantity from database
-    For other exchanges (BFO, CDS, MCX): Returns 1 (default)
+    Returns the configured freeze quantity for any F&O exchange (NFO, BFO, CDS,
+    MCX, ...) that has an entry, and 0 when none is configured.
+
+    0 means "no freeze limit known", which is what every caller already tests
+    for. It must not be 1: the table is seeded with NFO rows only, so BFO, CDS,
+    MCX and any NFO underlying without a row resolved to a freeze limit of one
+    unit, and callers that reject `quantity > freeze` then refused every order
+    on those exchanges -- one lot of SENSEX (20) or CRUDEOIL (100) is above 1.
+    The only reason this went unnoticed is that NFO index options, which do
+    have rows, are the common case.
 
     Args:
-        symbol: The underlying symbol (e.g., "NIFTY", "RELIANCE")
-        exchange: Exchange code (NFO, BFO, CDS, MCX)
+        symbol: The underlying symbol (e.g., "NIFTY", "RELIANCE", "SENSEX", "CRUDEOIL")
+        exchange: Exchange code (NFO, BFO, CDS, MCX, ...)
 
     Returns:
-        Freeze quantity (integer)
+        Freeze quantity, or 0 when none is configured.
     """
     global _cache_loaded
 
@@ -175,17 +183,13 @@ def get_freeze_qty(symbol: str, exchange: str) -> int:
     if not _cache_loaded:
         load_freeze_qty_cache()
 
-    # For non-NFO exchanges, return 1 as default (to be implemented later)
-    if exchange not in ["NFO"]:
-        return 1
-
-    # Look up in cache
+    # Look up the configured entry for this exchange+symbol.
     cache_key = f"{exchange}:{symbol}"
     if cache_key in _freeze_qty_cache:
         return _freeze_qty_cache[cache_key]
 
-    # If not found, return 1 as default
-    return 1
+    # Not configured. 0, never 1 -- see the note above.
+    return 0
 
 
 def get_freeze_qty_for_option(option_symbol: str, exchange: str) -> int:
@@ -194,29 +198,30 @@ def get_freeze_qty_for_option(option_symbol: str, exchange: str) -> int:
     Extracts the underlying from the symbol and looks up freeze qty.
 
     Examples:
-        NIFTY24DEC24000CE -> NIFTY
-        BANKNIFTY24DEC24FUT -> BANKNIFTY
-        RELIANCE24DEC241000CE -> RELIANCE
+        NIFTY24DEC24000CE -> NIFTY (NFO)
+        SENSEX25DEC2480000CE -> SENSEX (BFO)
+        CRUDEOIL25DEC246000CE -> CRUDEOIL (MCX)
+        USDINR25DEC2487CE -> USDINR (CDS)
 
     Args:
         option_symbol: Full option/futures symbol
         exchange: Exchange code
 
     Returns:
-        Freeze quantity (integer)
+        Freeze quantity, or 0 when the underlying has no configured limit.
     """
     import re
 
-    # For non-NFO exchanges, return 1 as default
-    if exchange not in ["NFO"]:
-        return 1
-
     # Extract underlying from option/futures symbol
     # Pattern: SYMBOL + DATE + optional(STRIKE) + TYPE(FUT/CE/PE)
-    # Examples: NIFTY24DEC24FUT, NIFTY24DEC2424000CE, RELIANCE24DEC241000PE
+    # Examples: NIFTY24DEC24FUT, NIFTY24DEC2424000CE, SENSEX25DEC2480000PE
 
-    # Try to match known index symbols first
-    index_symbols = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"]
+    # Try to match known index symbols first. Longest-prefix-first so e.g. NIFTYNXT50
+    # is not shadowed by NIFTY, and SENSEX50 is not shadowed by SENSEX.
+    index_symbols = [
+        "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50", "NIFTY",
+        "SENSEX50", "BANKEX", "SENSEX",
+    ]
     for idx_sym in index_symbols:
         if option_symbol.upper().startswith(idx_sym):
             return get_freeze_qty(idx_sym, exchange)
@@ -228,7 +233,9 @@ def get_freeze_qty_for_option(option_symbol: str, exchange: str) -> int:
         # Handle special cases like M&M, BAJAJ-AUTO
         return get_freeze_qty(underlying, exchange)
 
-    return 1
+    # The symbol did not parse (e.g. it starts with a digit, like 360ONE).
+    # Unknown, not "one unit".
+    return 0
 
 
 def get_all_freeze_qty(exchange: str = None) -> dict[str, int]:

@@ -230,9 +230,17 @@ def api_expiries():
     """API endpoint to get available expiry dates for FNO symbols"""
     exchange = request.args.get("exchange", "").strip() or None
     underlying = request.args.get("underlying", "").strip() or None
+    # Option-chain tools pass instrumenttype=options. Without it the list mixes
+    # futures and options expiries, which coincide on NFO but not on MCX.
+    instrumenttype = request.args.get("instrumenttype", "").strip() or None
 
-    logger.debug(f"Fetching expiries: exchange={exchange}, underlying={underlying}")
-    expiries = get_distinct_expiries(exchange=exchange, underlying=underlying)
+    logger.debug(
+        f"Fetching expiries: exchange={exchange}, underlying={underlying}, "
+        f"instrumenttype={instrumenttype}"
+    )
+    expiries = get_distinct_expiries(
+        exchange=exchange, underlying=underlying, instrumenttype=instrumenttype
+    )
 
     return jsonify({"status": "success", "expiries": expiries})
 
@@ -240,11 +248,24 @@ def api_expiries():
 @search_bp.route("/api/underlyings")
 @check_session_validity
 def api_underlyings():
-    """API endpoint to get available underlying symbols for FNO"""
-    exchange = request.args.get("exchange", "").strip() or None
+    """API endpoint to get available underlying symbols for FNO.
 
-    logger.debug(f"Fetching underlyings: exchange={exchange}")
-    underlyings = get_distinct_underlyings(exchange=exchange)
+    By default returns options-bearing underlyings only — the right shape for
+    option-chain / IV-chart / GEX dropdowns. Pass ``include_futures=true`` to
+    also include underlyings whose only live derivatives are futures (e.g. MCX
+    commodities like NATURALGASMINI, COPPER, LEADMINI). Used by /search/token.
+    """
+    exchange = request.args.get("exchange", "").strip() or None
+    include_futures = request.args.get("include_futures", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+    logger.debug(
+        f"Fetching underlyings: exchange={exchange}, include_futures={include_futures}"
+    )
+    underlyings = get_distinct_underlyings(exchange=exchange, include_futures=include_futures)
 
     # Filter out exchange test symbols (e.g. 011NSETEST, 021BSETEST)
     underlyings = [u for u in underlyings if "NSETEST" not in u and "BSETEST" not in u]

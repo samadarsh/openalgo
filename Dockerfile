@@ -1,5 +1,11 @@
 # ------------------------------ Python Builder Stage ----------------------- #
-FROM python:3.12-bullseye AS python-builder
+# Base images track Debian 13 "trixie". Debian 11 "bullseye" reached end of LTS
+# on 2026-08-31 and its security pool was drained days later, so every build
+# began failing with 404s on systemd, tzdata, libtiff5 and libgbm1 while the
+# package index still advertised them. Debian 12 "bookworm" is not the fix --
+# its regular security support ended 2026-07-11 and it is already LTS-only.
+# Trixie has security support to 2028-08-09 (LTS to 2030-06-30).
+FROM python:3.12-trixie AS python-builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl build-essential && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
@@ -10,20 +16,20 @@ RUN pip install --no-cache-dir uv && \
     uv venv .venv && \
     uv pip install --upgrade pip && \
     uv sync && \
-    uv pip install "gunicorn>=25.0,<26" eventlet && \
+    uv pip install "gunicorn>=25.0,<26" "eventlet==0.41.2" && \
     rm -rf /root/.cache
 
 # ------------------------------ Frontend Builder Stage --------------------- #
-FROM node:20-bullseye-slim AS frontend-builder
+FROM node:22-trixie-slim AS frontend-builder
 WORKDIR /app
 COPY frontend/package*.json ./frontend/
-RUN cd frontend && npm install
+RUN cd frontend && npm ci
 COPY frontend/ ./frontend/
 RUN cd frontend && npm run build
 
 # --------------------------------------------------------------------------- #
 # ------------------------------ Production Stage --------------------------- #
-FROM python:3.12-slim-bullseye AS production
+FROM python:3.12-slim-trixie AS production
 # 0 – set timezone to IST (Asia/Kolkata) & install runtime dependencies
 #     chromium + fonts-liberation are required by Kaleido 1.x (plotly static
 #     image export) which drives a real headless Chromium via choreographer.
@@ -39,8 +45,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ln -fs /usr/share/zoneinfo/Asia/Kolkata /etc/localtime && \
     dpkg-reconfigure -f noninteractive tzdata && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
-# 1 – user & workdir
-RUN useradd --create-home appuser
+# 1 – user & workdir.
+#     Pin appuser to UID/GID 1000 explicitly. install-docker.sh and
+#     install-docker-multi-custom-ssl.sh chown the host's .env to UID 1000
+#     before bind-mounting it into the container; if the container's
+#     appuser ends up at a different UID (which can happen on ARM64 base
+#     images that already have system users at low UIDs, or if the base
+#     image bumps its useradd defaults), the bind-mounted .env becomes
+#     unwritable to the running process. See marketcalls/openalgo#1394.
+RUN groupadd --gid 1000 appuser && \
+    useradd --create-home --uid 1000 --gid 1000 appuser
 WORKDIR /app
 # 2 – copy the ready-made venv and source with correct ownership
 COPY --from=python-builder --chown=appuser:appuser /app/.venv /app/.venv
@@ -49,7 +63,16 @@ COPY --chown=appuser:appuser . .
 COPY --from=frontend-builder --chown=appuser:appuser /app/frontend/dist /app/frontend/dist
 # 4 – create required directories with proper ownership and permissions
 #     Also create empty .env file with write permissions for Railway deployment
+#
+#     NOTE: chown /app itself (not just its contents). WORKDIR creates /app
+#     as root:root mode 755, and that ownership persists even after we
+#     COPY --chown=appuser:appuser into it. Without this chown the running
+#     appuser process can read/execute /app but cannot create new files
+#     there — which breaks any atomic-write helper that needs to put a
+#     temp file in /app (e.g. utils/env_check.py rotating FERNET_SALT in
+#     /app/.env). See marketcalls/openalgo#1394.
 RUN mkdir -p /app/log /app/log/strategies /app/db /app/tmp /app/tmp/numba_cache /app/tmp/matplotlib /app/strategies /app/strategies/scripts /app/strategies/examples /app/keys && \
+    chown appuser:appuser /app && \
     chown -R appuser:appuser /app/log /app/db /app/tmp /app/strategies /app/keys && \
     chmod -R 755 /app/strategies /app/log /app/tmp && \
     chmod 700 /app/keys && \

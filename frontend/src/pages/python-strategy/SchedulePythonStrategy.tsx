@@ -1,15 +1,16 @@
 import { ArrowLeft, Calendar, Clock } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
-import { showToast } from '@/utils/toast'
+import { Link, useNavigate, useParams } from 'react-router'
 import { pythonStrategyApi } from '@/api/python-strategy'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
+import { useStrategyExchanges } from '@/hooks/useStrategyExchanges'
 import type { PythonStrategy } from '@/types/python-strategy'
-import { CRYPTO_EXCHANGE_VALUE, SCHEDULE_DAYS, STRATEGY_EXCHANGES } from '@/types/python-strategy'
+import { CRYPTO_EXCHANGE_VALUE, SCHEDULE_DAYS } from '@/types/python-strategy'
+import { showToast } from '@/utils/toast'
 
 export default function SchedulePythonStrategy() {
   const { strategyId } = useParams<{ strategyId: string }>()
@@ -22,7 +23,9 @@ export default function SchedulePythonStrategy() {
   const [stopTime, setStopTime] = useState('15:30')
   const [selectedDays, setSelectedDays] = useState<string[]>(['mon', 'tue', 'wed', 'thu', 'fri'])
 
+  const { exchanges, getWindow } = useStrategyExchanges()
   const isCrypto = exchange === CRYPTO_EXCHANGE_VALUE
+  const sessionWindow = getWindow(exchange)
 
   useEffect(() => {
     const fetchStrategy = async () => {
@@ -36,7 +39,7 @@ export default function SchedulePythonStrategy() {
         if (data.schedule_start_time) setStartTime(data.schedule_start_time)
         if (data.schedule_stop_time) setStopTime(data.schedule_stop_time)
         if (data.schedule_days?.length) setSelectedDays(data.schedule_days)
-      } catch (error) {
+      } catch (_error) {
         showToast.error('Failed to load strategy', 'pythonStrategy')
         navigate('/python')
       } finally {
@@ -44,13 +47,10 @@ export default function SchedulePythonStrategy() {
       }
     }
     fetchStrategy()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [strategyId])
+  }, [strategyId, navigate])
 
   const handleDayToggle = (day: string) => {
-    setSelectedDays((prev) =>
-      prev.includes(day) ? prev.filter((d) => d !== day) : [...prev, day]
-    )
+    setSelectedDays((prev) => (prev.includes(day) ? prev.filter((d) => d !== day) : [...prev, day]))
   }
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -85,7 +85,7 @@ export default function SchedulePythonStrategy() {
       } else {
         showToast.error(response.message || 'Failed to save schedule', 'pythonStrategy')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to save schedule', 'pythonStrategy')
     } finally {
       setSaving(false)
@@ -164,7 +164,7 @@ export default function SchedulePythonStrategy() {
                 onChange={(e) => setExchange(e.target.value)}
                 className="w-full px-3 py-2 text-sm border rounded-md bg-background focus:outline-none focus:ring-2 focus:ring-primary"
               >
-                {STRATEGY_EXCHANGES.map((opt) => (
+                {exchanges.map((opt) => (
                   <option key={opt.value} value={opt.value}>
                     {opt.label}
                   </option>
@@ -178,33 +178,41 @@ export default function SchedulePythonStrategy() {
             </div>
 
             {/* Time Inputs */}
-            <div className="grid grid-cols-2 gap-4">
-              <div className="space-y-2">
-                <Label htmlFor="start_time" className="flex items-center gap-2">
-                  <Clock className="h-4 w-4" />
-                  Start Time (IST)
-                </Label>
-                <Input
-                  id="start_time"
-                  type="time"
-                  value={startTime}
-                  onChange={(e) => setStartTime(e.target.value)}
-                  required
-                />
+            <div className="space-y-2">
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <Label htmlFor="start_time" className="flex items-center gap-2">
+                    <Clock className="h-4 w-4" />
+                    Start Time (IST)
+                  </Label>
+                  <Input
+                    id="start_time"
+                    type="time"
+                    value={startTime}
+                    onChange={(e) => setStartTime(e.target.value)}
+                    required
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="stop_time" className="flex items-center gap-2">
+                    <Clock className="h-4 w-4" />
+                    Stop Time (IST)
+                  </Label>
+                  <Input
+                    id="stop_time"
+                    type="time"
+                    value={stopTime}
+                    onChange={(e) => setStopTime(e.target.value)}
+                    required
+                  />
+                </div>
               </div>
-              <div className="space-y-2">
-                <Label htmlFor="stop_time" className="flex items-center gap-2">
-                  <Clock className="h-4 w-4" />
-                  Stop Time (IST)
-                </Label>
-                <Input
-                  id="stop_time"
-                  type="time"
-                  value={stopTime}
-                  onChange={(e) => setStopTime(e.target.value)}
-                  required
-                />
-              </div>
+              {sessionWindow && !isCrypto && (
+                <p className="text-xs text-muted-foreground">
+                  {exchange} trades {sessionWindow.start} - {sessionWindow.stop} IST today. The
+                  strategy is stopped at whichever comes first, your stop time or the session close.
+                </p>
+              )}
             </div>
 
             {/* Days Selection */}
@@ -222,13 +230,21 @@ export default function SchedulePythonStrategy() {
                     }`}
                     onClick={() => handleDayToggle(day.value)}
                   >
-                    <div className={`h-4 w-4 rounded border flex items-center justify-center ${
-                      selectedDays.includes(day.value)
-                        ? 'bg-primary-foreground border-primary-foreground'
-                        : 'border-current'
-                    }`}>
+                    <div
+                      className={`h-4 w-4 rounded border flex items-center justify-center ${
+                        selectedDays.includes(day.value)
+                          ? 'bg-primary-foreground border-primary-foreground'
+                          : 'border-current'
+                      }`}
+                    >
                       {selectedDays.includes(day.value) && (
-                        <svg className="h-3 w-3 text-primary" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
+                        <svg
+                          className="h-3 w-3 text-primary"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="3"
+                        >
                           <polyline points="20 6 9 17 4 12" />
                         </svg>
                       )}

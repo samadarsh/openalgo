@@ -8,12 +8,12 @@ from flask import Blueprint, Response, jsonify, redirect, render_template, reque
 from database.auth_db import get_api_key_for_tradingview, get_auth_token
 from database.settings_db import get_analyze_mode
 from limiter import limiter
-from services.close_position_service import close_position
 from services.holdings_service import get_holdings
 from services.orderbook_service import get_orderbook
 from services.place_smart_order_service import place_smart_order
 from services.positionbook_service import get_positionbook
 from services.tradebook_service import get_tradebook
+from utils.latency_monitor import track_latency
 from utils.logging import get_logger
 from utils.session import check_session_validity
 
@@ -503,6 +503,7 @@ def export_positions():
 @orders_bp.route("/close_position", methods=["POST"])
 @check_session_validity
 @limiter.limit(API_RATE_LIMIT)
+@track_latency("CLOSE")
 def close_position():
     """Close a specific position - uses broker API in live mode, placesmartorder service in analyze mode"""
     try:
@@ -648,6 +649,7 @@ def close_position():
 @orders_bp.route("/close_all_positions", methods=["POST"])
 @check_session_validity
 @limiter.limit(API_RATE_LIMIT)
+@track_latency("CLOSE")
 def close_all_positions():
     """Close all open positions using the broker API"""
     try:
@@ -1018,7 +1020,9 @@ def approve_pending_order_route(order_id):
                 {
                     "status": "success",
                     "message": "Order approved and executed successfully",
-                    "broker_order_id": response_data.get("orderid"),
+                    "broker_order_id": response_data.get("broker_order_id")
+                    or response_data.get("orderid")
+                    or response_data.get("trigger_id"),
                 }
             )
         else:

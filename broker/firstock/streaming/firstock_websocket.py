@@ -29,7 +29,7 @@ class FirstockWebSocket:
     DISCONNECTED = 2
     ERROR = 3
 
-    def __init__(self, user_id, auth_token, max_retry_attempt=5, retry_delay=5):
+    def __init__(self, user_id, auth_token, max_retry_attempt=5, retry_delay=5, token_provider=None):
         """
         Initialize the Firstock WebSocket client
 
@@ -43,11 +43,17 @@ class FirstockWebSocket:
             Maximum number of retry attempts on connection failure
         retry_delay : int
             Delay between retry attempts in seconds
+        token_provider : callable, optional
+            Callable returning a fresh auth_token (susertoken) from the DB.
+            Used to refresh the token before each reconnect, since Firstock
+            tokens roll over daily at ~3 AM IST and the token is baked into
+            the connection URL.
         """
         self.user_id = user_id
         self.auth_token = auth_token
         self.max_retry_attempt = max_retry_attempt
         self.retry_delay = retry_delay
+        self.token_provider = token_provider
 
         # Connection management
         self.wsapp = None
@@ -93,6 +99,27 @@ class FirstockWebSocket:
         """Validate initialization parameters"""
         return bool(self.user_id and self.auth_token)
 
+    def _refresh_auth_token(self):
+        """Re-read a fresh auth token (susertoken) from the DB via token_provider.
+
+        Updates self.auth_token in place so the next _build_wsapp bakes the
+        current day's token into the connection URL. On failure the existing
+        token is kept.
+        """
+        if not self.token_provider:
+            return
+        try:
+            fresh = self.token_provider()
+            if fresh:
+                self.auth_token = fresh
+                self.logger.info("Refreshed Firstock auth token before reconnect")
+            else:
+                self.logger.warning(
+                    "Could not fetch fresh auth token on reconnect; using existing token"
+                )
+        except Exception as e:
+            self.logger.error(f"Error refreshing auth token before reconnect: {e}")
+
     def _build_wsapp(self):
         """
         Construct a fresh WebSocketApp bound to this instance's callbacks.
@@ -103,7 +130,7 @@ class FirstockWebSocket:
         """
         params = {"userId": self.user_id, "jKey": self.auth_token, "source": "developer-api"}
         connection_url = f"{self.ROOT_URI}?{urlencode(params)}"
-        self.logger.debug(f"Connection URL: {connection_url}")
+        self.logger.debug(f"Connection URL: {self.ROOT_URI}")
         return websocket.WebSocketApp(
             connection_url,
             on_open=self._on_open,
@@ -153,7 +180,7 @@ class FirstockWebSocket:
             self.logger.info(f"Connecting to Firstock WebSocket: {self.ROOT_URI}")
             self.logger.info(f"Using userId: {self.user_id}")
             self.logger.debug(
-                f"Using auth token (jKey): {self.auth_token[:10]}...{self.auth_token[-5:] if len(self.auth_token) > 15 else self.auth_token}"
+                f"Using auth token (jKey): {'present' if self.auth_token else 'missing'}"
             )
             self.logger.info(
                 "Note: The jKey must be the 'susertoken' obtained from Firstock's login API"
@@ -235,6 +262,12 @@ class FirstockWebSocket:
                 if self._shutdown_event.wait(self.retry_delay):
                     self.logger.info("Shutdown requested during retry wait; exiting supervisor")
                     break
+
+                # Re-read a fresh token from the DB before the next iteration
+                # rebuilds the connection URL. Firstock tokens roll over daily
+                # at ~3 AM IST; reusing the construction-time token reconnects
+                # with a dead jKey and the feed stays dead until a restart.
+                self._refresh_auth_token()
         finally:
             self.connection_state = self.DISCONNECTED
             self.logger.info("WebSocket supervisor exiting")
@@ -463,7 +496,7 @@ class FirstockWebSocket:
                             self.logger.error(f"Full response: {data}")
                             self.logger.error(f"Using userId: {self.user_id}")
                             self.logger.error(
-                                f"Using jKey (first 10 chars): {self.auth_token[:10] if self.auth_token else 'None'}..."
+                                f"Using jKey: {'present' if self.auth_token else 'None'}"
                             )
                             self.logger.error(
                                 "IMPORTANT: The jKey must be the 'susertoken' from Firstock's login API response"

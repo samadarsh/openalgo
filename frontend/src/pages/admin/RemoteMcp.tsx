@@ -5,13 +5,16 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronRight,
+  Copy,
   Globe,
   Loader2,
+  Power,
   RefreshCw,
+  Save,
   ShieldAlert,
 } from 'lucide-react'
 import { Fragment, useEffect, useMemo, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { adminApi } from '@/api/admin'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
@@ -35,6 +38,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { Switch } from '@/components/ui/switch'
 import {
   Table,
   TableBody,
@@ -43,8 +47,19 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import type { MCPAuditEntry, OAuthClient } from '@/types/admin'
+import type { MCPAuditEntry, MCPSettings, OAuthClient } from '@/types/admin'
 import { showToast } from '@/utils/toast'
+
+const RESTART_PENDING_KEY = 'mcp_restart_pending_settings'
+
+function settingsEqual(a: MCPSettings, b: MCPSettings): boolean {
+  return (
+    a.http_enabled === b.http_enabled &&
+    a.public_url === b.public_url &&
+    a.require_approval === b.require_approval &&
+    a.write_scope_enabled === b.write_scope_enabled
+  )
+}
 
 const SCOPE_FILTERS = [
   { value: '__all', label: 'All scopes' },
@@ -167,24 +182,99 @@ export default function RemoteMcp() {
   const [killSwitchBusy, setKillSwitchBusy] = useState(false)
   const [expandedAudit, setExpandedAudit] = useState<number | null>(null)
 
+  // Settings card state — runtime values, the user's pending edits, and a
+  // "restart required" tracker that survives page reloads. We persist the
+  // settings the user last saved in localStorage; on every load we compare
+  // them with the runtime values returned by GET /admin/api/mcp/settings.
+  // If they match the runtime, the service was restarted and changes took
+  // effect — clear the banner.
+  const [settings, setSettings] = useState<MCPSettings | null>(null)
+  const [pendingSettings, setPendingSettings] = useState<MCPSettings | null>(null)
+  const [savingSettings, setSavingSettings] = useState(false)
+  const [restartPending, setRestartPending] = useState<MCPSettings | null>(null)
+
   const loadAll = async () => {
     setLoading(true)
     try {
-      const [clientsRes, auditRes] = await Promise.all([
+      const [clientsRes, auditRes, settingsRes] = await Promise.all([
         adminApi.getOAuthClients(),
         adminApi.getMCPAudit({ limit: 100 }),
+        adminApi.getMCPSettings(),
       ])
       setMcpEnabled(clientsRes.mcp_enabled)
       setClients(clientsRes.clients)
       setSummary(clientsRes.summary)
       setAudit(auditRes.data)
       setAuditTotal(auditRes.total_in_window)
+      setSettings(settingsRes.settings)
+      setPendingSettings(settingsRes.settings)
+
+      // Reconcile saved-but-not-applied state stored in localStorage
+      // against what the running process actually reports back.
+      const stored = localStorage.getItem(RESTART_PENDING_KEY)
+      if (stored) {
+        try {
+          const parsed = JSON.parse(stored) as MCPSettings
+          if (settingsEqual(parsed, settingsRes.settings)) {
+            // Service was restarted — runtime now matches what was saved.
+            localStorage.removeItem(RESTART_PENDING_KEY)
+            setRestartPending(null)
+          } else {
+            setRestartPending(parsed)
+          }
+        } catch {
+          localStorage.removeItem(RESTART_PENDING_KEY)
+        }
+      } else {
+        setRestartPending(null)
+      }
     } catch {
       showToast.error('Failed to load Remote MCP state', 'admin')
     } finally {
       setLoading(false)
     }
   }
+
+  const handleSaveSettings = async () => {
+    if (!pendingSettings || !settings) return
+    if (settingsEqual(pendingSettings, settings)) return
+    setSavingSettings(true)
+    try {
+      const res = await adminApi.updateMCPSettings({
+        http_enabled: pendingSettings.http_enabled,
+        public_url: pendingSettings.public_url,
+        require_approval: pendingSettings.require_approval,
+        write_scope_enabled: pendingSettings.write_scope_enabled,
+      })
+      if (res.status !== 'success') {
+        showToast.error(res.message ?? 'Failed to save settings', 'admin')
+        return
+      }
+      // Persist the saved values so we can show the "restart required"
+      // banner on reloads until the running process actually picks them up.
+      localStorage.setItem(RESTART_PENDING_KEY, JSON.stringify(pendingSettings))
+      setRestartPending(pendingSettings)
+      showToast.success('Saved. Restart the openalgo service to apply.', 'admin')
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { message?: string } } })?.response?.data?.message ??
+        'Failed to save settings'
+      showToast.error(msg, 'admin')
+    } finally {
+      setSavingSettings(false)
+    }
+  }
+
+  const handleCopyMcpUrl = async (url: string) => {
+    try {
+      await navigator.clipboard.writeText(url)
+      showToast.success('MCP URL copied', 'admin')
+    } catch {
+      showToast.error('Copy failed — copy manually', 'admin')
+    }
+  }
+
+  const settingsDirty = !!(settings && pendingSettings && !settingsEqual(settings, pendingSettings))
 
   const reloadAudit = async () => {
     try {
@@ -201,6 +291,7 @@ export default function RemoteMcp() {
     }
   }
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: one-time initial load on mount; loadAll is recreated each render and adding it would re-run the load on every render
   useEffect(() => {
     loadAll()
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -260,32 +351,6 @@ export default function RemoteMcp() {
     )
   }
 
-  if (!mcpEnabled) {
-    return (
-      <div className="py-6 space-y-6">
-        <div className="flex items-center gap-3">
-          <Link to="/admin">
-            <Button variant="ghost" size="sm">
-              <ArrowLeft className="h-4 w-4 mr-1" /> Back
-            </Button>
-          </Link>
-          <h1 className="text-2xl font-bold flex items-center gap-2">
-            <Globe className="h-6 w-6" /> Remote MCP
-          </h1>
-        </div>
-        <Alert>
-          <ShieldAlert className="h-4 w-4" />
-          <AlertTitle>Remote MCP is disabled on this install</AlertTitle>
-          <AlertDescription>
-            Set <code>MCP_HTTP_ENABLED=True</code> in <code>.env</code> and restart, or run{' '}
-            <code>install/enable-remote-mcp.sh</code>. Local stdio MCP (Claude Desktop / Cursor /
-            Windsurf) is unaffected and works regardless of this setting.
-          </AlertDescription>
-        </Alert>
-      </div>
-    )
-  }
-
   return (
     <div className="py-6 space-y-6">
       {/* Header */}
@@ -304,248 +369,434 @@ export default function RemoteMcp() {
           <Button variant="outline" size="sm" onClick={loadAll}>
             <RefreshCw className="h-4 w-4 mr-1" /> Refresh
           </Button>
-          <Button
-            variant="destructive"
-            size="sm"
-            onClick={() => setKillSwitchOpen(true)}
-            title="Revoke every active refresh token"
-          >
-            <AlertTriangle className="h-4 w-4 mr-1" /> Kill switch
-          </Button>
+          {mcpEnabled ? (
+            <Button
+              variant="destructive"
+              size="sm"
+              onClick={() => setKillSwitchOpen(true)}
+              title="Revoke every active refresh token"
+            >
+              <AlertTriangle className="h-4 w-4 mr-1" /> Kill switch
+            </Button>
+          ) : null}
         </div>
       </div>
 
-      {/* Summary */}
-      <div className="grid grid-cols-3 gap-4">
-        <Card>
-          <CardContent className="pt-6">
-            <div className="text-xs uppercase text-muted-foreground">Pending</div>
-            <div className="text-3xl font-bold text-amber-600">{summary.pending}</div>
-            <div className="text-xs text-muted-foreground">awaiting approval</div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-6">
-            <div className="text-xs uppercase text-muted-foreground">Approved</div>
-            <div className="text-3xl font-bold text-emerald-600">{summary.approved}</div>
-            <div className="text-xs text-muted-foreground">active clients</div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-6">
-            <div className="text-xs uppercase text-muted-foreground">Revoked</div>
-            <div className="text-3xl font-bold text-muted-foreground">{summary.revoked}</div>
-            <div className="text-xs text-muted-foreground">disabled</div>
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* Pending */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Pending approvals</CardTitle>
-          <CardDescription>
-            New DCR-registered clients land here. Approve only ones you recognize.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          {pending.length === 0 ? (
-            <p className="text-sm text-muted-foreground">No clients awaiting approval.</p>
-          ) : (
-            pending.map((c) => (
-              <ClientCard
-                key={c.client_id}
-                client={c}
-                busy={busyClient === c.client_id}
-                onApprove={() => handleApprove(c.client_id)}
-                onRevoke={() => setRevokeTarget(c)}
-              />
-            ))
-          )}
-        </CardContent>
-      </Card>
-
-      {/* Approved */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Approved clients</CardTitle>
-          <CardDescription>
-            Currently authorized to complete OAuth flows and call MCP tools.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          {approved.length === 0 ? (
-            <p className="text-sm text-muted-foreground">No approved clients yet.</p>
-          ) : (
-            approved.map((c) => (
-              <ClientCard
-                key={c.client_id}
-                client={c}
-                busy={busyClient === c.client_id}
-                onApprove={() => handleApprove(c.client_id)}
-                onRevoke={() => setRevokeTarget(c)}
-              />
-            ))
-          )}
-        </CardContent>
-      </Card>
-
-      {/* Revoked (collapsed by default — show count, expand on demand) */}
-      {revoked.length > 0 ? (
+      {/* Settings card (always visible) */}
+      {settings && pendingSettings ? (
         <Card>
           <CardHeader>
-            <CardTitle>Revoked clients ({revoked.length})</CardTitle>
-            <CardDescription>Historical record. These cannot complete OAuth.</CardDescription>
+            <div className="flex items-center justify-between flex-wrap gap-3">
+              <div>
+                <CardTitle className="flex items-center gap-2">
+                  <Power className="h-5 w-5" />
+                  Remote MCP settings
+                </CardTitle>
+                <CardDescription>
+                  Toggle Remote MCP on or off and adjust its OAuth posture. Changes are written to
+                  <code className="mx-1">.env</code>; the openalgo service must be restarted before
+                  they take effect.
+                </CardDescription>
+              </div>
+              <Badge variant={mcpEnabled ? 'default' : 'secondary'}>
+                Currently {mcpEnabled ? 'enabled' : 'disabled'}
+              </Badge>
+            </div>
           </CardHeader>
-          <CardContent className="space-y-3">
-            {revoked.map((c) => (
-              <ClientCard
-                key={c.client_id}
-                client={c}
-                busy={false}
-                onApprove={() => {}}
-                onRevoke={() => {}}
+          <CardContent className="space-y-5">
+            {/* MCP URL display — only when public URL is configured */}
+            {pendingSettings.mcp_url ? (
+              <div className="rounded-lg border bg-muted/30 p-3">
+                <div className="text-xs uppercase text-muted-foreground mb-1">MCP URL</div>
+                <div className="flex items-center gap-2">
+                  <code className="flex-1 font-mono text-sm break-all">
+                    {pendingSettings.mcp_url}
+                  </code>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => handleCopyMcpUrl(pendingSettings.mcp_url)}
+                  >
+                    <Copy className="h-3.5 w-3.5 mr-1" /> Copy
+                  </Button>
+                </div>
+                <div className="text-xs text-muted-foreground mt-2">
+                  Point your hosted AI client (claude.ai, chatgpt.com) at this URL.
+                </div>
+              </div>
+            ) : null}
+
+            {/* Public URL input — required when enabling */}
+            <div className="space-y-1.5">
+              <label htmlFor="mcp-public-url" className="text-sm font-medium">
+                Public HTTPS origin
+              </label>
+              <Input
+                id="mcp-public-url"
+                value={pendingSettings.public_url}
+                onChange={(e) =>
+                  setPendingSettings({ ...pendingSettings, public_url: e.target.value.trim() })
+                }
+                placeholder="https://yourdomain.com"
               />
-            ))}
+              <p className="text-xs text-muted-foreground">
+                Same as your OpenAlgo dashboard URL. Required when MCP is enabled. Used as the JWT
+                issuer / audience claim — tokens are scoped to this exact origin.
+              </p>
+            </div>
+
+            {/* Toggles */}
+            <div className="space-y-4">
+              <div className="flex items-start justify-between gap-4 py-2 border-t pt-4">
+                <div>
+                  <div className="text-sm font-medium">Remote MCP enabled</div>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    Master switch for the <code>/mcp</code> and <code>/oauth/*</code> endpoints.
+                    Local stdio MCP (Claude Desktop / Cursor) is unaffected.
+                  </p>
+                </div>
+                <Switch
+                  checked={pendingSettings.http_enabled}
+                  onCheckedChange={(v) =>
+                    setPendingSettings({ ...pendingSettings, http_enabled: v })
+                  }
+                />
+              </div>
+
+              <div className="flex items-start justify-between gap-4 py-2">
+                <div>
+                  <div className="text-sm font-medium">Auto-approve hosted clients</div>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    When ON, DCR-registered clients can complete OAuth without admin approval.
+                    Suitable for single-trader self-hosted installs. Turn OFF on shared deployments
+                    to require manual approval per client.
+                  </p>
+                </div>
+                <Switch
+                  checked={!pendingSettings.require_approval}
+                  onCheckedChange={(v) =>
+                    setPendingSettings({ ...pendingSettings, require_approval: !v })
+                  }
+                />
+              </div>
+
+              <div className="flex items-start justify-between gap-4 py-2">
+                <div>
+                  <div className="text-sm font-medium">Allow order placement (write:orders)</div>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    When ON, AI clients can place / modify / cancel orders via MCP. Turn OFF for
+                    read-only access (quotes, holdings, positions, market data only).
+                  </p>
+                </div>
+                <Switch
+                  checked={pendingSettings.write_scope_enabled}
+                  onCheckedChange={(v) =>
+                    setPendingSettings({ ...pendingSettings, write_scope_enabled: v })
+                  }
+                />
+              </div>
+            </div>
+
+            {/* Save button */}
+            <div className="flex items-center justify-between pt-2 border-t">
+              <div className="text-xs text-muted-foreground">
+                {settingsDirty ? 'Unsaved changes' : 'No pending changes'}
+              </div>
+              <div className="flex gap-2">
+                {settingsDirty ? (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setPendingSettings(settings)}
+                    disabled={savingSettings}
+                  >
+                    Discard
+                  </Button>
+                ) : null}
+                <Button
+                  size="sm"
+                  onClick={handleSaveSettings}
+                  disabled={!settingsDirty || savingSettings}
+                >
+                  {savingSettings ? (
+                    <Loader2 className="h-4 w-4 mr-1 animate-spin" />
+                  ) : (
+                    <Save className="h-4 w-4 mr-1" />
+                  )}
+                  Save changes
+                </Button>
+              </div>
+            </div>
           </CardContent>
         </Card>
       ) : null}
 
-      {/* Audit log */}
-      <Card>
-        <CardHeader>
-          <CardTitle>MCP tool call audit</CardTitle>
-          <CardDescription>
-            Tail of <code>log/mcp.jsonl</code>. Every tool call by any client is recorded with
-            timestamp, jti, scope, and outcome — params themselves are stored as a SHA-256 hash.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="flex flex-wrap gap-2 mb-4">
-            <Input
-              placeholder="Filter by tool name (substring)"
-              value={auditTool}
-              onChange={(e) => setAuditTool(e.target.value.slice(0, 100))}
-              className="max-w-xs"
-            />
-            <Select value={auditScope} onValueChange={setAuditScope}>
-              <SelectTrigger className="w-44">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {SCOPE_FILTERS.map((opt) => (
-                  <SelectItem key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Select value={auditOutcome} onValueChange={setAuditOutcome}>
-              <SelectTrigger className="w-44">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {OUTCOME_FILTERS.map((opt) => (
-                  <SelectItem key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Button variant="outline" size="sm" onClick={reloadAudit}>
-              Apply
-            </Button>
+      {/* Restart-required banner — shown until the running process picks up the saved values */}
+      {restartPending ? (
+        <Alert variant="default" className="border-amber-300 dark:border-amber-700">
+          <AlertTriangle className="h-4 w-4 text-amber-600" />
+          <AlertTitle>Restart required to apply changes</AlertTitle>
+          <AlertDescription>
+            Settings saved to <code>.env</code>. Run the following on your server to load them:
+            <pre className="mt-2 rounded bg-muted px-3 py-2 text-xs font-mono">
+              sudo systemctl restart openalgo
+            </pre>
+            <span className="block mt-2 text-xs">
+              This banner clears automatically once the running service reflects the new values.
+            </span>
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
+      {/* Disabled state — short hint only; the toggle is in the settings card above */}
+      {!mcpEnabled ? (
+        <Alert>
+          <ShieldAlert className="h-4 w-4" />
+          <AlertTitle>Remote MCP is currently disabled</AlertTitle>
+          <AlertDescription>
+            Hosted AI clients can't reach <code>/mcp</code> right now. Enable it from the settings
+            card above, then restart the service. Local stdio MCP (Claude Desktop / Cursor /
+            Windsurf) is unaffected and works regardless.
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
+      {/* The dashboard sections below only make sense when MCP is running */}
+      {!mcpEnabled ? null : (
+        <>
+          {/* Summary */}
+          <div className="grid grid-cols-3 gap-4">
+            <Card>
+              <CardContent className="pt-6">
+                <div className="text-xs uppercase text-muted-foreground">Pending</div>
+                <div className="text-3xl font-bold text-amber-600">{summary.pending}</div>
+                <div className="text-xs text-muted-foreground">awaiting approval</div>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardContent className="pt-6">
+                <div className="text-xs uppercase text-muted-foreground">Approved</div>
+                <div className="text-3xl font-bold text-emerald-600">{summary.approved}</div>
+                <div className="text-xs text-muted-foreground">active clients</div>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardContent className="pt-6">
+                <div className="text-xs uppercase text-muted-foreground">Revoked</div>
+                <div className="text-3xl font-bold text-muted-foreground">{summary.revoked}</div>
+                <div className="text-xs text-muted-foreground">disabled</div>
+              </CardContent>
+            </Card>
           </div>
 
-          <div className="text-xs text-muted-foreground mb-2">
-            Showing {audit.length} of {auditTotal} entries
-          </div>
+          {/* Pending */}
+          <Card>
+            <CardHeader>
+              <CardTitle>Pending approvals</CardTitle>
+              <CardDescription>
+                New DCR-registered clients land here. Approve only ones you recognize.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {pending.length === 0 ? (
+                <p className="text-sm text-muted-foreground">No clients awaiting approval.</p>
+              ) : (
+                pending.map((c) => (
+                  <ClientCard
+                    key={c.client_id}
+                    client={c}
+                    busy={busyClient === c.client_id}
+                    onApprove={() => handleApprove(c.client_id)}
+                    onRevoke={() => setRevokeTarget(c)}
+                  />
+                ))
+              )}
+            </CardContent>
+          </Card>
 
-          {audit.length === 0 ? (
-            <p className="text-sm text-muted-foreground">No tool calls yet.</p>
-          ) : (
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="w-8" />
-                  <TableHead>Time</TableHead>
-                  <TableHead>Tool</TableHead>
-                  <TableHead>Scope</TableHead>
-                  <TableHead>Outcome</TableHead>
-                  <TableHead>Latency</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {audit
-                  .slice()
-                  .reverse()
-                  .map((entry, idx) => {
-                    const isOpen = expandedAudit === idx
-                    return (
-                      <Fragment key={`${entry.ts}-${entry.jti}-${idx}`}>
-                        <TableRow
-                          key={`${entry.ts}-${entry.jti}-${idx}`}
-                          className="cursor-pointer hover:bg-muted/50"
-                          onClick={() => setExpandedAudit(isOpen ? null : idx)}
-                        >
-                          <TableCell>
-                            {isOpen ? (
-                              <ChevronDown className="h-4 w-4" />
-                            ) : (
-                              <ChevronRight className="h-4 w-4" />
-                            )}
-                          </TableCell>
-                          <TableCell className="font-mono text-xs">{entry.ts}</TableCell>
-                          <TableCell className="font-mono text-xs">{entry.tool}</TableCell>
-                          <TableCell>
-                            <Badge variant="outline" className="text-xs">
-                              {entry.scope}
-                            </Badge>
-                          </TableCell>
-                          <TableCell>
-                            <Badge
-                              variant={entry.outcome === 'success' ? 'default' : 'destructive'}
-                              className="text-xs"
+          {/* Approved */}
+          <Card>
+            <CardHeader>
+              <CardTitle>Approved clients</CardTitle>
+              <CardDescription>
+                Currently authorized to complete OAuth flows and call MCP tools.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {approved.length === 0 ? (
+                <p className="text-sm text-muted-foreground">No approved clients yet.</p>
+              ) : (
+                approved.map((c) => (
+                  <ClientCard
+                    key={c.client_id}
+                    client={c}
+                    busy={busyClient === c.client_id}
+                    onApprove={() => handleApprove(c.client_id)}
+                    onRevoke={() => setRevokeTarget(c)}
+                  />
+                ))
+              )}
+            </CardContent>
+          </Card>
+
+          {/* Revoked (collapsed by default — show count, expand on demand) */}
+          {revoked.length > 0 ? (
+            <Card>
+              <CardHeader>
+                <CardTitle>Revoked clients ({revoked.length})</CardTitle>
+                <CardDescription>Historical record. These cannot complete OAuth.</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                {revoked.map((c) => (
+                  <ClientCard
+                    key={c.client_id}
+                    client={c}
+                    busy={false}
+                    onApprove={() => {}}
+                    onRevoke={() => {}}
+                  />
+                ))}
+              </CardContent>
+            </Card>
+          ) : null}
+
+          {/* Audit log */}
+          <Card>
+            <CardHeader>
+              <CardTitle>MCP tool call audit</CardTitle>
+              <CardDescription>
+                Tail of <code>log/mcp.jsonl</code>. Every tool call by any client is recorded with
+                timestamp, jti, scope, and outcome — params themselves are stored as a SHA-256 hash.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <div className="flex flex-wrap gap-2 mb-4">
+                <Input
+                  placeholder="Filter by tool name (substring)"
+                  value={auditTool}
+                  onChange={(e) => setAuditTool(e.target.value.slice(0, 100))}
+                  className="max-w-xs"
+                />
+                <Select value={auditScope} onValueChange={setAuditScope}>
+                  <SelectTrigger className="w-44">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {SCOPE_FILTERS.map((opt) => (
+                      <SelectItem key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Select value={auditOutcome} onValueChange={setAuditOutcome}>
+                  <SelectTrigger className="w-44">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {OUTCOME_FILTERS.map((opt) => (
+                      <SelectItem key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Button variant="outline" size="sm" onClick={reloadAudit}>
+                  Apply
+                </Button>
+              </div>
+
+              <div className="text-xs text-muted-foreground mb-2">
+                Showing {audit.length} of {auditTotal} entries
+              </div>
+
+              {audit.length === 0 ? (
+                <p className="text-sm text-muted-foreground">No tool calls yet.</p>
+              ) : (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="w-8" />
+                      <TableHead>Time</TableHead>
+                      <TableHead>Tool</TableHead>
+                      <TableHead>Scope</TableHead>
+                      <TableHead>Outcome</TableHead>
+                      <TableHead>Latency</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {audit
+                      .slice()
+                      .reverse()
+                      .map((entry, idx) => {
+                        const isOpen = expandedAudit === idx
+                        return (
+                          <Fragment key={`${entry.ts}-${entry.jti}-${idx}`}>
+                            <TableRow
+                              key={`${entry.ts}-${entry.jti}-${idx}`}
+                              className="cursor-pointer hover:bg-muted/50"
+                              onClick={() => setExpandedAudit(isOpen ? null : idx)}
                             >
-                              {entry.outcome}
-                            </Badge>
-                          </TableCell>
-                          <TableCell className="text-xs">
-                            {entry.duration_ms != null ? `${entry.duration_ms} ms` : '—'}
-                          </TableCell>
-                        </TableRow>
-                        {isOpen ? (
-                          <TableRow>
-                            <TableCell colSpan={6} className="bg-muted/30 text-xs">
-                              <div className="grid grid-cols-1 md:grid-cols-3 gap-2 py-2">
-                                <div>
-                                  <span className="text-muted-foreground">Client:</span>{' '}
-                                  <span className="font-mono">{entry.client_id ?? '—'}</span>
-                                </div>
-                                <div>
-                                  <span className="text-muted-foreground">JTI:</span>{' '}
-                                  <span className="font-mono">{entry.jti ?? '—'}</span>
-                                </div>
-                                <div>
-                                  <span className="text-muted-foreground">IP:</span>{' '}
-                                  <span className="font-mono">{entry.request_ip ?? '—'}</span>
-                                </div>
-                                <div className="md:col-span-3">
-                                  <span className="text-muted-foreground">Params hash:</span>{' '}
-                                  <span className="font-mono">{entry.params_hash ?? '—'}</span>
-                                </div>
-                              </div>
-                            </TableCell>
-                          </TableRow>
-                        ) : null}
-                      </Fragment>
-                    )
-                  })}
-              </TableBody>
-            </Table>
-          )}
-        </CardContent>
-      </Card>
+                              <TableCell>
+                                {isOpen ? (
+                                  <ChevronDown className="h-4 w-4" />
+                                ) : (
+                                  <ChevronRight className="h-4 w-4" />
+                                )}
+                              </TableCell>
+                              <TableCell className="font-mono text-xs">{entry.ts}</TableCell>
+                              <TableCell className="font-mono text-xs">{entry.tool}</TableCell>
+                              <TableCell>
+                                <Badge variant="outline" className="text-xs">
+                                  {entry.scope}
+                                </Badge>
+                              </TableCell>
+                              <TableCell>
+                                <Badge
+                                  variant={entry.outcome === 'success' ? 'default' : 'destructive'}
+                                  className="text-xs"
+                                >
+                                  {entry.outcome}
+                                </Badge>
+                              </TableCell>
+                              <TableCell className="text-xs">
+                                {entry.duration_ms != null ? `${entry.duration_ms} ms` : '—'}
+                              </TableCell>
+                            </TableRow>
+                            {isOpen ? (
+                              <TableRow>
+                                <TableCell colSpan={6} className="bg-muted/30 text-xs">
+                                  <div className="grid grid-cols-1 md:grid-cols-3 gap-2 py-2">
+                                    <div>
+                                      <span className="text-muted-foreground">Client:</span>{' '}
+                                      <span className="font-mono">{entry.client_id ?? '—'}</span>
+                                    </div>
+                                    <div>
+                                      <span className="text-muted-foreground">JTI:</span>{' '}
+                                      <span className="font-mono">{entry.jti ?? '—'}</span>
+                                    </div>
+                                    <div>
+                                      <span className="text-muted-foreground">IP:</span>{' '}
+                                      <span className="font-mono">{entry.request_ip ?? '—'}</span>
+                                    </div>
+                                    <div className="md:col-span-3">
+                                      <span className="text-muted-foreground">Params hash:</span>{' '}
+                                      <span className="font-mono">{entry.params_hash ?? '—'}</span>
+                                    </div>
+                                  </div>
+                                </TableCell>
+                              </TableRow>
+                            ) : null}
+                          </Fragment>
+                        )
+                      })}
+                  </TableBody>
+                </Table>
+              )}
+            </CardContent>
+          </Card>
+        </>
+      )}
 
       {/* Revoke confirmation dialog */}
       <AlertDialog open={!!revokeTarget} onOpenChange={(o) => !o && setRevokeTarget(null)}>

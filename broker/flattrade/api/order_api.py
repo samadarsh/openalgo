@@ -1,10 +1,17 @@
 import json
 import os
-
-import httpx
 import threading
 import time
 
+import httpx
+
+from broker.flattrade.api.rate_limit import (
+    DATA_LIMITER,
+    ORDER_LIMITER,
+    clamp_from_response,
+    rate_limit_retry_delay,
+)
+from broker.flattrade.mapping.order_data import normalize_order_status
 from broker.flattrade.mapping.transform_data import (
     map_product_type,
     reverse_map_product_type,
@@ -19,7 +26,14 @@ from utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-def get_api_response(endpoint, auth, method="GET", payload=""):
+def get_api_response(endpoint, auth, method="GET", payload="", retry_count=0):
+    # OrderBook/TradeBook/PositionBook/Holdings are non-order endpoints, but
+    # they are polled continuously by the UI and by the order-update poller, so
+    # they have to be counted against the same window data.py uses. Leaving them
+    # unpaced is what let ordinary dashboard polling trip the account's ceiling
+    # (issue #1806).
+    DATA_LIMITER.acquire()
+
     AUTH_TOKEN = auth
 
     full_api_key = os.getenv("BROKER_API_KEY")
@@ -42,9 +56,18 @@ def get_api_response(endpoint, auth, method="GET", payload=""):
 
     url = f"https://piconnect.flattrade.in{endpoint}"
     response = client.request(method, url, content=payload, headers=headers)
-    data = response.text
+    parsed = json.loads(response.text)
 
-    return json.loads(data)
+    # Pacing alone is not enough: an account provisioned below the configured
+    # cap only reveals its real ceiling in the rejection text, so learn from it
+    # and retry. Without this the limiter keeps re-offering the rejected rate
+    # and every later poll fails the same way (issue #1806).
+    delay = rate_limit_retry_delay(parsed, DATA_LIMITER, retry_count, endpoint)
+    if delay is not None:
+        time.sleep(delay)
+        return get_api_response(endpoint, auth, method, payload, retry_count + 1)
+
+    return parsed
 
 
 def get_order_book(auth):
@@ -122,7 +145,7 @@ def get_open_position(tradingsymbol, exchange, producttype, auth):
     tradingsymbol = get_br_symbol(tradingsymbol, exchange)
     positions_data = _get_cached_positions(auth)
 
-    logger.info(f"{positions_data}")
+    logger.debug(f"{positions_data}")
 
     net_qty = "0"
 
@@ -130,7 +153,7 @@ def get_open_position(tradingsymbol, exchange, producttype, auth):
         isinstance(positions_data, dict) and (positions_data["stat"] == "Not_Ok")
     ):
         # Handle the case where there is no data
-        logger.info("No data available.")
+        logger.debug("No data available.")
         net_qty = "0"
 
     if positions_data and isinstance(positions_data, list):
@@ -158,13 +181,20 @@ def place_order_api(data, auth):
 
     payload = "jData=" + json.dumps(newdata) + "&jKey=" + AUTH_TOKEN
 
-    logger.info(f"{payload}")
+    logger.debug(f"{newdata}")
     # Get the shared httpx client
     client = get_httpx_client()
 
+    # Order endpoints have their own, four-times-tighter ceiling
+    # (10/sec, 40/min) — paced separately from the data window.
+    ORDER_LIMITER.acquire()
     url = "https://piconnect.flattrade.in/PiConnectAPI/PlaceOrder"
     res = client.post(url, content=payload, headers=headers)
     response_data = res.json()
+    # Clamp on a rate-limit rejection, but never auto-retry an order: this
+    # cannot tell "rejected for rate" from "accepted, response lost", and a
+    # duplicate order is far worse than a failed one. Surface it instead.
+    clamp_from_response(response_data, ORDER_LIMITER)
 
     # Add status attribute for backward compatibility
     res.status = res.status_code
@@ -197,8 +227,8 @@ def place_smartorder_api(data, auth):
             get_open_position(symbol, exchange, map_product_type(product), AUTH_TOKEN)
         )
 
-        logger.info(f"position_size : {position_size}")
-        logger.info(f"Open Position : {current_position}")
+        logger.debug(f"position_size : {position_size}")
+        logger.debug(f"Open Position : {current_position}")
 
         # Determine action based on position_size and current_position
         action = None
@@ -208,12 +238,12 @@ def place_smartorder_api(data, auth):
         if position_size == 0 and current_position == 0 and int(data["quantity"]) != 0:
             action = data["action"]
             quantity = data["quantity"]
-            # logger.info(f"action : {action}")
-            # logger.info(f"Quantity : {quantity}")
+            # logger.debug(f"action : {action}")
+            # logger.debug(f"Quantity : {quantity}")
             res, response, orderid = place_order_api(data, AUTH_TOKEN)
             _invalidate_position_cache(AUTH_TOKEN)
-            # logger.info(f"{res}")
-            # logger.info(f"{response}")
+            # logger.debug(f"{res}")
+            # logger.debug(f"{response}")
 
             return res, response, orderid
 
@@ -244,11 +274,11 @@ def place_smartorder_api(data, auth):
             if position_size > current_position:
                 action = "BUY"
                 quantity = position_size - current_position
-                # logger.info(f"smart buy quantity : {quantity}")
+                # logger.debug(f"smart buy quantity : {quantity}")
             elif position_size < current_position:
                 action = "SELL"
                 quantity = current_position - position_size
-                # logger.info(f"smart sell quantity : {quantity}")
+                # logger.debug(f"smart sell quantity : {quantity}")
 
         if action:
             # Prepare data for placing the order
@@ -256,13 +286,13 @@ def place_smartorder_api(data, auth):
             order_data["action"] = action
             order_data["quantity"] = str(quantity)
 
-            # logger.info(f"{order_data}")
+            # logger.debug(f"{order_data}")
             # Place the order
             res, response, orderid = place_order_api(order_data, auth)
             _invalidate_position_cache(AUTH_TOKEN)
-            # logger.info(f"{res}")
-            logger.info(f"{response}")
-            logger.info(f"{orderid}")
+            # logger.debug(f"{res}")
+            logger.debug(f"{response}")
+            logger.debug(f"{orderid}")
 
             return res, response, orderid
 
@@ -290,7 +320,7 @@ def close_all_positions(current_api_key, auth):
 
             # get openalgo symbol to send to placeorder function
             symbol = get_symbol(position["token"], position["exch"])
-            logger.info(f"The Symbol is {symbol}")
+            logger.debug(f"The Symbol is {symbol}")
 
             # Prepare the order payload
             place_order_payload = {
@@ -304,14 +334,14 @@ def close_all_positions(current_api_key, auth):
                 "quantity": str(quantity),
             }
 
-            logger.info(f"{place_order_payload}")
+            logger.debug(f"{place_order_payload}")
 
             # Place the order to close the position
             res, response, orderid = place_order_api(place_order_payload, auth)
 
-            # logger.info(f"{res}")
-            # logger.info(f"{response}")
-            # logger.info(f"{orderid}")
+            # logger.debug(f"{res}")
+            # logger.debug(f"{response}")
+            # logger.debug(f"{orderid}")
 
             # Note: Ensure place_order_api handles any errors and logs accordingly
 
@@ -332,10 +362,14 @@ def cancel_order(orderid, auth):
     # Get the shared httpx client and send the request
     client = get_httpx_client()
 
+    # Order endpoints have their own, four-times-tighter ceiling
+    # (10/sec, 40/min) — paced separately from the data window.
+    ORDER_LIMITER.acquire()
     url = "https://piconnect.flattrade.in/PiConnectAPI/CancelOrder"
     res = client.post(url, content=payload, headers=headers)
     data = res.json()
-    logger.info(f"{data}")
+    clamp_from_response(data, ORDER_LIMITER)  # clamp only, never retry an order
+    logger.debug(f"{data}")
 
     # Check if the request was successful
     if data.get("stat") == "Ok":
@@ -364,18 +398,21 @@ def modify_order(data, auth):
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
     payload = "jData=" + json.dumps(transformed_data) + "&jKey=" + AUTH_TOKEN
 
-    logger.info(f"Modify Order Payload: {payload}")
-    logger.info(f"Modify Order Data: {transformed_data}")
+    logger.debug(f"Modify Order Data: {transformed_data}")
 
     # Get the shared httpx client
     client = get_httpx_client()
 
+    # Order endpoints have their own, four-times-tighter ceiling
+    # (10/sec, 40/min) — paced separately from the data window.
+    ORDER_LIMITER.acquire()
     url = "https://piconnect.flattrade.in/PiConnectAPI/ModifyOrder"
     res = client.post(url, content=payload, headers=headers)
     response = res.json()
+    clamp_from_response(response, ORDER_LIMITER)  # clamp only, never retry an order
 
-    logger.info(f"Modify Order Response: {response}")
-    logger.info(f"Modify Order Status Code: {res.status_code}")
+    logger.debug(f"Modify Order Response: {response}")
+    logger.debug(f"Modify Order Status Code: {res.status_code}")
 
     if response.get("stat") == "Ok":
         return {"status": "success", "orderid": data["orderid"]}, 200
@@ -392,15 +429,17 @@ def cancel_all_orders_api(data, auth):
     AUTH_TOKEN = auth
 
     order_book_response = get_order_book(AUTH_TOKEN)
-    # logger.info(f"{order_book_response}")
+    # logger.debug(f"{order_book_response}")
     if order_book_response is None:
         return [], []  # Return empty lists indicating failure to retrieve the order book
 
-    # Filter orders that are in 'open' or 'trigger_pending' state
+    # Filter orders still working at the exchange (OPEN / PENDING / TRIGGER_PENDING)
     orders_to_cancel = [
-        order for order in order_book_response if order["status"] in ["OPEN", "TRIGGER_PENDING"]
+        order
+        for order in order_book_response
+        if normalize_order_status(order.get("status")) == "open"
     ]
-    # logger.info(f"{orders_to_cancel}")
+    # logger.debug(f"{orders_to_cancel}")
     canceled_orders = []
     failed_cancellations = []
 

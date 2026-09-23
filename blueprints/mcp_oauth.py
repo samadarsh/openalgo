@@ -130,14 +130,14 @@ def _supported_scopes() -> list[str]:
     DCR or token request that asks for it returns ``invalid_scope``.
     """
     scopes = [SCOPE_READ_MARKET, SCOPE_READ_ACCOUNT]
-    if os.getenv("MCP_OAUTH_WRITE_SCOPE_ENABLED", "False").lower() == "true":
+    if os.getenv("MCP_OAUTH_WRITE_SCOPE_ENABLED", "True").lower() == "true":
         scopes.append(SCOPE_WRITE_ORDERS)
     return scopes
 
 
 def _require_approval() -> bool:
     """Whether DCR-registered clients must be approved by the admin first."""
-    return os.getenv("MCP_OAUTH_REQUIRE_APPROVAL", "True").lower() == "true"
+    return os.getenv("MCP_OAUTH_REQUIRE_APPROVAL", "False").lower() == "true"
 
 
 def _oauth_error(error_code: str, description: str, status: int):
@@ -292,11 +292,11 @@ def register_client():
     - ``token_endpoint_auth_method`` must be one of the three we
       explicitly support; default ``client_secret_basic``
 
-    When ``MCP_OAUTH_REQUIRE_APPROVAL=True`` (the default per the PRD),
-    the new client lands with ``approved=False`` and the OAuth flow at
-    ``/oauth/authorize`` must reject it until the admin approves on the
-    forthcoming admin UI. Until that lands the admin can flip the flag
-    via ``database/oauth_db.py`` directly.
+    When ``MCP_OAUTH_REQUIRE_APPROVAL=True`` the new client lands with
+    ``approved=False`` and the OAuth flow at ``/oauth/authorize`` must
+    reject it until the admin approves at /admin/remote-mcp. The default
+    is False (auto-approve) on single-trader self-hosted installs; flip
+    the env var on shared / public deployments.
     """
     data = request.get_json(silent=True) or {}
     if not isinstance(data, dict):
@@ -479,33 +479,73 @@ _CONSENT_TEMPLATE = """\
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="referrer" content="no-referrer">
+  <!--
+    Referrer-Policy: 'same-origin' sends the full Referer on the same-origin
+    POST back to /oauth/authorize (required by Flask-WTF's WTF_CSRF_SSL_STRICT
+    check on HTTPS — without it the POST is rejected with "The referrer
+    header is missing.") but strips it on the cross-origin 302 to the OAuth
+    client's redirect_uri, so authorization codes / state never leak to the
+    third-party origin via Referer.
+  -->
+  <meta name="referrer" content="same-origin">
   <title>Authorize {{ client_name }} — OpenAlgo</title>
   <style>
     body { font-family: system-ui, -apple-system, sans-serif; background: #f9fafb;
-           margin: 0; padding: 0; min-height: 100vh; display: flex;
+           color: #111827; margin: 0; padding: 0; min-height: 100vh; display: flex;
            align-items: center; justify-content: center; }
     .card { background: white; border-radius: 12px; padding: 32px;
             box-shadow: 0 4px 24px rgba(0,0,0,0.08); max-width: 480px;
             width: 92%; }
-    h1 { margin: 0 0 8px; font-size: 22px; }
+    h1 { margin: 0 0 8px; font-size: 22px; color: #111827; }
     p { color: #4b5563; line-height: 1.5; }
-    .scopes { background: #f3f4f6; border-radius: 8px; padding: 12px;
-              margin: 16px 0; font-family: monospace; }
-    .scopes li { margin: 4px 0; }
+    .scopes-label { font-weight: 600; color: #111827; margin: 16px 0 8px; }
+    .scopes {
+      list-style: none;
+      margin: 0 0 8px;
+      padding: 12px;
+      background: #f3f4f6;
+      border-radius: 8px;
+    }
+    .scopes li { padding: 4px 0; }
+    .scope-name {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 13px;
+      font-weight: 600;
+      color: #111827;
+    }
+    .scope-desc { font-size: 12.5px; color: #4b5563; margin-top: 2px; line-height: 1.45; }
     .row { display: flex; gap: 12px; margin-top: 24px; }
     button { flex: 1; padding: 12px; border-radius: 8px; border: 0;
-             font-size: 14px; font-weight: 600; cursor: pointer; }
+             font-size: 14px; font-weight: 600; cursor: pointer;
+             font-family: inherit; }
     .approve { background: #10b981; color: white; }
     .deny { background: #f3f4f6; color: #374151; }
     .totp { margin: 16px 0; padding: 12px; background: #fef3c7;
-            border-left: 4px solid #f59e0b; border-radius: 4px; }
+            border-left: 4px solid #f59e0b; border-radius: 4px; color: #78350f; }
     input[type=text] { padding: 10px; font-size: 16px; width: 100%;
                        box-sizing: border-box; border: 1px solid #d1d5db;
                        border-radius: 6px; font-family: monospace;
                        letter-spacing: 4px; text-align: center; }
     .err { color: #b91c1c; font-size: 13px; margin-top: 8px; }
-    .meta { color: #6b7280; font-size: 12px; margin-top: 16px; }
+    .meta {
+      margin-top: 20px;
+      padding-top: 14px;
+      border-top: 1px solid #e5e7eb;
+      display: grid;
+      grid-template-columns: max-content 1fr;
+      column-gap: 12px;
+      row-gap: 4px;
+      align-items: baseline;
+      font-size: 12px;
+      color: #6b7280;
+    }
+    .meta-label { font-weight: 600; color: #6b7280; }
+    .meta code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      color: #4b5563;
+      word-break: break-all;
+    }
   </style>
 </head>
 <body>
@@ -513,9 +553,14 @@ _CONSENT_TEMPLATE = """\
     <h1>Authorize {{ client_name }}</h1>
     <p>This MCP client is requesting access to your OpenAlgo install.</p>
 
-    <p><strong>Scopes requested:</strong></p>
+    <div class="scopes-label">Scopes requested:</div>
     <ul class="scopes">
-      {% for s in scopes %}<li>{{ s }}</li>{% endfor %}
+      {% for s in scopes %}
+      <li>
+        <div class="scope-name">{{ s }}</div>
+        <div class="scope-desc">{% if s == 'read:market' %}Read live and historical market data — quotes, depth, history.{% elif s == 'read:account' %}Read your portfolio — orders, holdings, positions, funds.{% elif s == 'write:orders' %}Place, modify and cancel real orders on your behalf.{% else %}{{ s }}{% endif %}</div>
+      </li>
+      {% endfor %}
     </ul>
 
     {% if requires_fresh_totp %}
@@ -552,8 +597,8 @@ _CONSENT_TEMPLATE = """\
     </form>
 
     <div class="meta">
-      Client: <code>{{ client_id }}</code><br>
-      Redirect: <code>{{ redirect_uri }}</code>
+      <span class="meta-label">Client</span><code>{{ client_id }}</code>
+      <span class="meta-label">Redirect</span><code>{{ redirect_uri }}</code>
     </div>
   </div>
 </body>
