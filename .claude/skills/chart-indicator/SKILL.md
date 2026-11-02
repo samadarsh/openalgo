@@ -59,6 +59,45 @@ The descriptor contract has only gained optional fields since this skill was
 written, so an existing indicator keeps working on the pinned build. What
 changed, newest first:
 
+- **2.6.9: nothing for a descriptor to change.** A security release for the
+  library's build toolchain and documentation site; the published code is
+  2.6.8's apart from the version string. The registry stays at 112 and the
+  index at 438 names.
+
+- **2.6.8: volume on price-driven elements.** Renko, range bar, line break
+  and point and figure elements now carry the volume traded while they
+  formed (all of a source bar's volume on the first element it completes, 0
+  on the rest), so a custom study reading `bar.volume` on Chart bars sees
+  real volume there instead of nothing. Kagi still keeps its line thickness
+  in `volume`, so a volume study on a Kagi chart needs Underlying bars. An
+  instrument that reports no volume, such as an index, still leaves it
+  undefined: guard for that. Higher-timeframe warmup now crosses weekends and
+  holidays instead of failing with "Insufficient confirmed history", and OHLC
+  bars widen with the zoom. No descriptor field or export changed.
+
+- **2.6.7: independent confirmed study history.** `/trading` and Historify
+  attach `createTimeframeProvider`, so built-in higher-timeframe studies fetch
+  their own warmup, including daily EMA 200 on a five-minute chart. Custom
+  requested descriptors can declare `historyBars`; consume snapshot availability
+  rather than assuming the last source candle is closed. A live-only provider
+  is not a historical replay snapshot. Hosts derive custom intervals through
+  `withTimeframes` using real source capabilities and exchange sessions. Shared
+  favorites are UI preferences, not proof that a broker supplies an interval.
+  Existing descriptors and legacy providers remain supported.
+
+- **2.6.6: nothing for a descriptor to change.** Legend actions now sit
+  before changing readings, so crosshair movement and live ticks keep the
+  same click targets. The packaged widget opens the selected study's settings;
+  `/trading` keeps its existing host dialog. The registry stays at 112 and
+  the generated index at 433 names.
+
+- **2.6.5: nothing for a descriptor to change.** The packaged widget puts
+  running studies before its catalog and adds searchable, grouped mobile
+  drawing tools with shared favorites. Historify uses the widget's drawing
+  controls; both pages keep their custom indicator pickers. The trade-feed adapter
+  also serializes order modifications and requires reconciliation after an
+  uncertain outcome. Indicator calculations and saved descriptors are unchanged.
+
 - **2.6.4: nothing for a descriptor to change.** An order flow release in the
   profile tier: the footprint compares a cell beside an untraded row with
   zero, gains a delta-shaded volume view, zone alerts (`onZoneAlert`), a
