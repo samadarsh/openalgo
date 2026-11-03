@@ -55,6 +55,7 @@ The current v1 surface contains **66 method/path pairs**. A resource with both G
 | POST | `/funds` | [Funds](./account-services/funds.md) |
 | POST | `/margin` | [Margin](./account-services/margin.md) |
 | POST | `/orderbook` | [Order book](./account-services/orderbook.md) |
+| POST | `/pendingorders` | [Action Center pending orders](./order-information/pendingorders.md) |
 | POST | `/tradebook` | [Trade book](./account-services/tradebook.md) |
 | POST | `/positionbook` | [Position book](./account-services/positionbook.md) |
 | POST | `/holdings` | [Holdings](./account-services/holdings.md) |

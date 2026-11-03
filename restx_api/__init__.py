@@ -41,6 +41,7 @@ from .options_multiorder import api as options_multiorder_ns
 from .options_order import api as options_order_ns
 from .orderbook import api as orderbook_ns
 from .orderstatus import api as orderstatus_ns
+from .pending_orders import api as pending_orders_ns
 from .ping import api as ping_ns
 from .place_gtt_order import api as place_gtt_order_ns
 from .place_order import api as place_order_ns
@@ -79,6 +80,7 @@ api.add_namespace(option_chain_ns, path="/optionchain")
 api.add_namespace(intervals_ns, path="/intervals")
 api.add_namespace(funds_ns, path="/funds")
 api.add_namespace(orderbook_ns, path="/orderbook")
+api.add_namespace(pending_orders_ns, path="/pendingorders")
 api.add_namespace(tradebook_ns, path="/tradebook")
 api.add_namespace(positionbook_ns, path="/positionbook")
 api.add_namespace(holdings_ns, path="/holdings")

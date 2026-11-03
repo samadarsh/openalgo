@@ -58,3 +58,11 @@ class ChartSchema(Schema):
 
 class PnlSymbolsSchema(Schema):
     apikey = fields.Str(required=True, validate=validate.Length(min=1, max=256))
+
+
+class PendingOrdersSchema(Schema):
+    apikey = fields.Str(required=True, validate=validate.Length(min=1, max=256))
+    status = fields.Str(
+        load_default=None, validate=validate.OneOf(["pending", "approved", "rejected"])
+    )
+    limit = fields.Int(load_default=100, validate=validate.Range(min=1, max=500))
