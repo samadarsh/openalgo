@@ -347,10 +347,12 @@ def toggle_analyzer_mode(
             # Skip logging for invalid API keys to prevent database flooding
             return False, error_response, 403
 
-        # Check if in semi-auto mode - block analyzer toggle for RA compliance
-        from database.auth_db import get_order_mode
+        # Check if in semi-auto mode - block analyzer toggle for RA compliance.
+        # The order mode is stored per user, so resolve the API key to its user first.
+        from database.auth_db import get_order_mode, verify_api_key
 
-        order_mode = get_order_mode(api_key)
+        user_id = verify_api_key(api_key)
+        order_mode = get_order_mode(user_id) if user_id else "auto"
 
         if order_mode == "semi_auto":
             error_response = {
