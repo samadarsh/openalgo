@@ -36,6 +36,7 @@ curl -X POST http://127.0.0.1:5000/api/v1/analyzer \
   "data": {
     "analyze_mode": true,
     "mode": "analyze",
+    "order_mode": "auto",
     "total_logs": 2
   }
 }
@@ -49,6 +50,7 @@ curl -X POST http://127.0.0.1:5000/api/v1/analyzer \
   "data": {
     "analyze_mode": false,
     "mode": "live",
+    "order_mode": "semi_auto",
     "total_logs": 0
   }
 }
@@ -73,6 +75,7 @@ curl -X POST http://127.0.0.1:5000/api/v1/analyzer \
 |-------|------|-------------|
 | analyze_mode | boolean | true if analyzer mode is active |
 | mode | string | "analyze" or "live" |
+| order_mode | string | "auto" or "semi_auto". In "semi_auto", order placement through the API is queued in the Action Center for approval, and cancel, modify and close calls are refused outside analyzer mode |
 | total_logs | number | Number of orders logged in analyzer mode |
 
 ## What is Analyzer Mode?

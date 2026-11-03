@@ -153,7 +153,11 @@ def apply_analyze_mode(
 
 
 def get_analyzer_status_with_auth(
-    analyzer_data: dict[str, Any], auth_token: str, broker: str, original_data: dict[str, Any]
+    analyzer_data: dict[str, Any],
+    auth_token: str,
+    broker: str,
+    original_data: dict[str, Any],
+    order_mode: str | None = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Get analyzer mode status and statistics.
@@ -163,6 +167,8 @@ def get_analyzer_status_with_auth(
         auth_token: Authentication token for the broker API
         broker: Name of the broker
         original_data: Original request data for logging
+        order_mode: The caller's order mode ('auto' or 'semi_auto'), included in the
+            response when known
 
     Returns:
         Tuple containing:
@@ -189,6 +195,10 @@ def get_analyzer_status_with_auth(
                 "total_logs": logs_count,
             },
         }
+        if order_mode is not None:
+            # Lets an API client confirm Semi-Auto (orders queued for the Action Center)
+            # before it sends anything.
+            response_data["data"]["order_mode"] = order_mode
 
         log_executor.submit(async_log_order, "analyzer_status", request_data, response_data)
         return True, response_data, 200
@@ -295,7 +305,13 @@ def get_analyzer_status(
             # Skip logging for invalid API keys to prevent database flooding
             return False, error_response, 403
 
-        return get_analyzer_status_with_auth(analyzer_data, AUTH_TOKEN, broker_name, original_data)
+        from database.auth_db import get_order_mode, verify_api_key
+
+        user_id = verify_api_key(api_key)
+        order_mode = get_order_mode(user_id) if user_id else None
+        return get_analyzer_status_with_auth(
+            analyzer_data, AUTH_TOKEN, broker_name, original_data, order_mode=order_mode
+        )
 
     # Case 2: Direct internal call with auth_token and broker
     elif auth_token and broker:
